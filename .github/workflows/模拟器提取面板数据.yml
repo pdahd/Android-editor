@@ -1,4 +1,4 @@
-name: 模拟器提取面板数据 v4 (修复ANR阻塞)
+name: 模拟器提取面板数据 v5 (修复误点击)
 
 on:
   workflow_dispatch:
@@ -37,7 +37,35 @@ jobs:
 
       - name: 准备辅助脚本
         run: |
-          cat > tap_helper.py << 'PYEOF'
+          # tap_exact.py: 精确匹配（完整文本），且只匹配 clickable=true 的元素
+          cat > tap_exact.py << 'PYEOF'
+          import xml.etree.ElementTree as ET
+          import re, sys
+
+          xml_path = sys.argv[1]
+          search_text = sys.argv[2]
+          try:
+              tree = ET.parse(xml_path)
+          except Exception:
+              sys.exit(1)
+          for node in tree.iter('node'):
+              text = node.get('text') or ''
+              desc = node.get('content-desc') or ''
+              clickable = node.get('clickable', 'false')
+              # 精确匹配：文本完全相同，或content-desc完全相同
+              if (text == search_text or desc == search_text) and clickable == 'true':
+                  bounds = node.get('bounds', '')
+                  m = re.findall(r'\d+', bounds)
+                  if len(m) == 4:
+                      cx = (int(m[0]) + int(m[2])) // 2
+                      cy = (int(m[1]) + int(m[3])) // 2
+                      print(f"{cx} {cy}")
+                      sys.exit(0)
+          sys.exit(1)
+          PYEOF
+
+          # tap_contains.py: 模糊匹配（包含文本），且只匹配 clickable=true 的元素
+          cat > tap_contains.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
 
@@ -50,7 +78,8 @@ jobs:
           for node in tree.iter('node'):
               text = (node.get('text') or '').lower()
               desc = (node.get('content-desc') or '').lower()
-              if search_text in text or search_text in desc:
+              clickable = node.get('clickable', 'false')
+              if clickable == 'true' and (search_text in text or search_text in desc):
                   bounds = node.get('bounds', '')
                   m = re.findall(r'\d+', bounds)
                   if len(m) == 4:
@@ -61,10 +90,10 @@ jobs:
           sys.exit(1)
           PYEOF
 
+          # list_ui_helper.py
           cat > list_ui_helper.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
-
           try:
               tree = ET.parse(sys.argv[1])
               for node in tree.iter('node'):
@@ -84,10 +113,10 @@ jobs:
               print(f"Error: {e}")
           PYEOF
 
+          # find_video_thumb.py
           cat > find_video_thumb.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
-
           try:
               tree = ET.parse(sys.argv[1])
               for node in tree.iter('node'):
@@ -107,6 +136,7 @@ jobs:
           sys.exit(1)
           PYEOF
 
+          # emu_script.sh
           cat > emu_script.sh << 'BASHEOF'
           #!/bin/bash
           set -x
@@ -120,14 +150,28 @@ jobs:
             adb pull /sdcard/ui.xml "output/ui_dumps/${1}.xml" 2>/dev/null || true
           }
 
-          tap_text() {
+          # 精确匹配：文本必须完全相同 + clickable=true
+          tap_exact() {
             adb shell uiautomator dump /sdcard/ui_tap.xml 2>/dev/null
             adb pull /sdcard/ui_tap.xml /tmp/ui_tap.xml 2>/dev/null || return 1
             local coords
-            coords=$(python3 tap_helper.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
+            coords=$(python3 tap_exact.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
             local cx=$(echo "$coords" | cut -d' ' -f1)
             local cy=$(echo "$coords" | cut -d' ' -f2)
-            echo ">>> TAP '$1' at ${cx},${cy}"
+            echo ">>> EXACT TAP '$1' at ${cx},${cy}"
+            adb shell input tap "$cx" "$cy"
+            return 0
+          }
+
+          # 模糊匹配：包含文本 + clickable=true
+          tap_contains() {
+            adb shell uiautomator dump /sdcard/ui_tap.xml 2>/dev/null
+            adb pull /sdcard/ui_tap.xml /tmp/ui_tap.xml 2>/dev/null || return 1
+            local coords
+            coords=$(python3 tap_contains.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
+            local cx=$(echo "$coords" | cut -d' ' -f1)
+            local cy=$(echo "$coords" | cut -d' ' -f2)
+            echo ">>> CONTAINS TAP '$1' at ${cx},${cy}"
             adb shell input tap "$cx" "$cy"
             return 0
           }
@@ -136,19 +180,6 @@ jobs:
             adb shell uiautomator dump /sdcard/ui_list.xml 2>/dev/null
             adb pull /sdcard/ui_list.xml /tmp/ui_list.xml 2>/dev/null || return 1
             python3 list_ui_helper.py /tmp/ui_list.xml 2>/dev/null
-          }
-
-          # 清除所有系统弹窗（ANR、崩溃等）
-          clear_system_dialogs() {
-            echo "--- 清除系统弹窗 ---"
-            for i in 1 2 3 4 5; do
-              tap_text "Wait" && { echo "点击了 Wait"; sleep 2; continue; }
-              tap_text "Close app" && { echo "点击了 Close app"; sleep 2; continue; }
-              tap_text "OK" && { echo "点击了 OK"; sleep 2; continue; }
-              # 没有找到系统弹窗，退出循环
-              echo "无系统弹窗"
-              break
-            done
           }
 
           echo "========== 阶段 1: 安装与初始化 =========="
@@ -167,11 +198,8 @@ jobs:
             -d file:///sdcard/DCIM/test_video.mp4 2>/dev/null
           sleep 3
 
-          # 禁用 Pixel Launcher 防止 ANR
-          echo "--- 禁用 Pixel Launcher 避免 ANR ---"
+          # 禁用 Pixel Launcher 防 ANR
           adb shell pm disable-user --user 0 com.google.android.apps.nexuslauncher 2>/dev/null || true
-          adb shell settings put secure default_input_method com.android.inputmethod.latin/.LatinIME 2>/dev/null || true
-          # 杀掉已存在的 Launcher 进程
           adb shell am force-stop com.google.android.apps.nexuslauncher 2>/dev/null || true
           sleep 2
 
@@ -179,136 +207,125 @@ jobs:
           adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity
           sleep 25
           snap "01_app_launch"
-          echo "--- 启动后UI ---"
           list_ui | tee output/logs/01_ui.txt
 
-          echo "========== 阶段 3: 处理弹窗 =========="
-
-          # 第一轮：处理任何系统弹窗（Pixel Launcher ANR 等）
-          clear_system_dialogs
+          echo "========== 阶段 3: 同意服务条款 =========="
+          # 首先处理可能的 Launcher ANR
+          tap_exact "Wait" || tap_exact "Close app" || true
           sleep 2
-          snap "02_after_system_clear"
-          echo "--- 系统弹窗处理后UI ---"
+
+          # 直接精确点击 "Agree and continue"
+          echo "--- 点击 Agree and continue ---"
+          tap_exact "Agree and continue"
+          sleep 5
+          snap "02_after_agree"
           list_ui | tee output/logs/02_ui.txt
 
-          # 第二轮：处理 CapCut ToS
-          echo "--- 尝试点击 Agree and continue ---"
-          tap_text "Agree and continue" || tap_text "Agree" || true
-          sleep 5
-          snap "03_after_agree"
-          echo "--- 同意后UI ---"
-          list_ui | tee output/logs/03_ui.txt
+          # 如果还在 ToS 页面，再试一次
+          tap_exact "Agree and continue" || true
+          sleep 3
 
-          # 第三轮：再次清理可能的系统弹窗
-          clear_system_dialogs
-          sleep 2
+          echo "========== 阶段 4: 处理后续弹窗 =========="
+          for attempt in 1 2 3 4 5 6; do
+            echo "--- 弹窗处理 第${attempt}轮 ---"
+            snap "03_popup_${attempt}"
+            list_ui | tee "output/logs/03_popup_${attempt}.txt"
 
-          # 第四轮：处理 App 内后续弹窗
-          for attempt in 1 2 3 4 5; do
-            echo "--- App弹窗处理 第${attempt}轮 ---"
-            snap "04_popup_round_${attempt}"
-            list_ui | tee "output/logs/04_popup_${attempt}.txt"
-
-            # 尝试各种可能的按钮文案
-            tap_text "Allow" || tap_text "Not now" || tap_text "Skip" || \
-            tap_text "Got it" || tap_text "Later" || tap_text "No thanks" || \
-            tap_text "Maybe later" || tap_text "Close" || tap_text "Cancel" || \
-            tap_text "Deny" || tap_text "Don" || true
+            # 精确匹配各种弹窗按钮
+            tap_exact "Allow" || \
+            tap_exact "While using the app" || \
+            tap_exact "Not now" || \
+            tap_exact "Skip" || \
+            tap_exact "Got it" || \
+            tap_exact "Later" || \
+            tap_exact "No thanks" || \
+            tap_exact "Maybe later" || \
+            tap_exact "Close" || \
+            tap_exact "Cancel" || \
+            tap_exact "Deny" || \
+            tap_exact "Don't allow" || \
+            tap_exact "ALLOW" || \
+            tap_exact "DENY" || \
+            tap_exact "Agree and continue" || \
+            true
             sleep 3
 
-            # 也处理可能再次出现的系统弹窗
-            clear_system_dialogs
+            # 也处理 Launcher ANR
+            tap_exact "Wait" || tap_exact "Close app" || true
             sleep 1
           done
-          snap "05_all_dialogs_done"
-          echo "--- 所有弹窗处理后UI ---"
-          list_ui | tee output/logs/05_ui.txt
+          snap "04_dialogs_done"
+          list_ui | tee output/logs/04_ui.txt
 
-          echo "========== 阶段 4: 等待后台下载 =========="
-          echo "等待 60 秒..."
+          echo "========== 阶段 5: 等待后台下载 =========="
           sleep 60
-
-          echo "--- effect 目录 (中期) ---"
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/mid_effect_dir.txt
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" | tee output/logs/mid_channels.txt
-          snap "06_after_wait"
+          snap "05_after_wait"
+          list_ui | tee output/logs/05_ui.txt
+
+          echo "========== 阶段 6: 进入编辑器 =========="
+          tap_exact "Wait" || tap_exact "Close app" || true
+          sleep 1
+
+          tap_exact "New project" || tap_contains "new project" || true
+          sleep 5
+          snap "06_new_project"
           list_ui | tee output/logs/06_ui.txt
 
-          echo "========== 阶段 5: 进入编辑器 =========="
-          # 再清一次系统弹窗
-          clear_system_dialogs
-          sleep 1
-
-          tap_text "New project" || tap_text "New Project" || true
-          sleep 5
-          snap "07_new_project"
-          list_ui | tee output/logs/07_ui.txt
-
-          # 可能需要再清弹窗
-          clear_system_dialogs
-          sleep 1
-
-          # 选择 Videos
-          tap_text "Videos" || tap_text "Video" || true
+          # 选择视频
+          tap_exact "Videos" || tap_contains "video" || true
           sleep 3
-          snap "08_videos_tab"
-          list_ui | tee output/logs/08_ui.txt
 
-          # 找视频缩略图
           adb shell uiautomator dump /sdcard/ui_vid.xml 2>/dev/null
           adb pull /sdcard/ui_vid.xml /tmp/ui_vid.xml 2>/dev/null
           VIDEO_XY=$(python3 find_video_thumb.py /tmp/ui_vid.xml 2>/dev/null) || VIDEO_XY=""
-
           if [ -n "$VIDEO_XY" ]; then
             VX=$(echo "$VIDEO_XY" | cut -d' ' -f1)
             VY=$(echo "$VIDEO_XY" | cut -d' ' -f2)
             echo ">>> TAP video at ${VX},${VY}"
             adb shell input tap "$VX" "$VY"
           else
-            echo ">>> Fallback: tap 270,900"
             adb shell input tap 270 900
           fi
           sleep 3
-          snap "09_video_selected"
+          snap "07_video_selected"
+          list_ui | tee output/logs/07_ui.txt
+
+          tap_exact "Add" || tap_contains "add" || tap_contains "next" || true
+          sleep 10
+          snap "08_editor"
+          list_ui | tee output/logs/08_ui.txt
+
+          echo "========== 阶段 7: 文字编辑 =========="
+          tap_exact "Wait" || true
+          sleep 1
+          tap_exact "Text" || tap_contains "text" || true
+          sleep 3
+          snap "09_text_menu"
           list_ui | tee output/logs/09_ui.txt
 
-          # 点击 Add
-          tap_text "Add" || tap_text "Next" || tap_text "Done" || true
-          sleep 10
-          snap "10_editor"
-          list_ui | tee output/logs/10_ui.txt
-
-          echo "========== 阶段 6: 文字编辑 =========="
-          clear_system_dialogs
-          sleep 1
-
-          tap_text "Text" || true
+          tap_exact "Add text" || tap_exact "Default text" || tap_contains "add text" || true
           sleep 3
-          snap "11_text_menu"
-          list_ui | tee output/logs/11_ui.txt
-
-          tap_text "Add text" || tap_text "Add Text" || tap_text "Default text" || true
-          sleep 3
-          # 按返回键关闭键盘
           adb shell input keyevent 4
           sleep 2
-          snap "12_text_added"
-          list_ui | tee output/logs/12_ui.txt
+          snap "10_text_added"
+          list_ui | tee output/logs/10_ui.txt
 
-          echo "========== 阶段 7: 遍历字幕面板 =========="
+          echo "========== 阶段 8: 遍历字幕面板 =========="
           for panel in Templates Fonts Styles Effects Animations Bubble; do
             echo "=== 面板: $panel ==="
-            clear_system_dialogs
-            tap_text "$panel" || true
+            tap_exact "Wait" || true
+            tap_exact "$panel" || tap_contains "$panel" || true
             sleep 8
-            snap "13_panel_${panel}"
-            list_ui | tee "output/logs/13_panel_${panel}.txt"
+            snap "11_panel_${panel}"
+            list_ui | tee "output/logs/11_panel_${panel}.txt"
           done
 
-          echo "========== 阶段 8: 等待API =========="
+          echo "========== 阶段 9: 等待API =========="
           sleep 60
 
-          echo "========== 阶段 9: 最终数据提取 =========="
+          echo "========== 阶段 10: 最终数据提取 =========="
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/final_effect_dir.txt
           adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 \( -name 'effectchannel*' -o -name 'effect_version*' \)" 2>/dev/null | tee output/logs/final_channels.txt
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null" | tee output/logs/final_rpdb.txt
@@ -322,7 +339,7 @@ jobs:
 
           adb shell "cat /data/data/com.lemon.lvoverseas/shared_prefs/tt_device_info.xml" > output/logs/device_info.xml 2>/dev/null || true
 
-          echo "========== 阶段 10: 日志 =========="
+          echo "========== 阶段 11: 日志 =========="
           adb logcat -d > output/logs/full_logcat.txt 2>/dev/null
           grep -i "respool" output/logs/full_logcat.txt 2>/dev/null | tail -50 | tee output/logs/respool_calls.txt || true
           grep -iE "effect.*panel|category/effects|get_panel_info" output/logs/full_logcat.txt 2>/dev/null | tail -30 | tee output/logs/effect_api.txt || true
@@ -363,6 +380,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-recon-v4
+          name: emulator-recon-v5
           path: output/
           retention-days: 7
