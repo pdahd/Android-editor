@@ -1,0 +1,111 @@
+name: 最小改动测试 - 验证API是否依赖签名
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip curl
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+          ls -la official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 只改 Manifest (加 debuggable)
+        run: |
+          java -jar apktool.jar d -s official.apk -o manifest_work -f
+
+          # 只加 debuggable=true，不改其他任何东西
+          sed -i 's/<application/<application android:debuggable="true"/' manifest_work/AndroidManifest.xml
+
+          echo "=== 验证修改 ==="
+          grep -o 'android:debuggable="true"' manifest_work/AndroidManifest.xml && echo "✅ debuggable 已添加"
+          grep -o 'android:allowBackup="false"' manifest_work/AndroidManifest.xml && echo "ℹ️ allowBackup 保持 false（debuggable 会覆盖此限制）"
+
+          java -jar apktool.jar b manifest_work -o temp_manifest.apk
+          mkdir -p work
+          unzip -o temp_manifest.apk AndroidManifest.xml -d work/
+
+      - name: 只 Patch liba.so (防闪退)
+        run: |
+          mkdir -p work/lib/armeabi-v7a
+          unzip -o official.apk lib/armeabi-v7a/liba.so -d work/
+
+          SO_FILE="work/lib/armeabi-v7a/liba.so"
+
+          echo "=== Patch 1: Skip verification ==="
+          printf '\x36\x00\x00\xea' | dd of="$SO_FILE" bs=1 seek=$((0x10b484)) conv=notrunc
+
+          echo "=== Patch 2: Neuter abort ==="
+          printf '\x1e\xff\x2f\xe1' | dd of="$SO_FILE" bs=1 seek=$((0x306c50)) conv=notrunc
+
+          echo "✅ liba.so 已修补"
+
+      - name: 组装 APK (只替换 Manifest + liba.so)
+        run: |
+          cp official.apk test_minimal.apk
+          zip -d test_minimal.apk "META-INF/*" 2>/dev/null || true
+
+          cd work
+          zip -0 ../test_minimal.apk AndroidManifest.xml
+          zip -0 ../test_minimal.apk lib/armeabi-v7a/liba.so
+          cd ..
+
+          echo "=== 组装完成 ==="
+          ls -la test_minimal.apk
+
+      - name: 对齐 + 签名
+        run: |
+          ZIPALIGN=$(find "$ANDROID_HOME" -name zipalign -type f | sort -V | tail -1)
+          APKSIGNER=$(find "$ANDROID_HOME" -name apksigner -type f | sort -V | tail -1)
+
+          KS_PASS="$(printf '%s' "${{ secrets.ANDROID_KEYSTORE_PASS }}" | tr -d '\r\n')"
+          ALIAS="$(printf '%s' "${{ secrets.ANDROID_KEY_ALIAS }}" | tr -d '\r\n ')"
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > release.jks
+
+          "$ZIPALIGN" -p -f 4 test_minimal.apk test_aligned.apk
+          "$APKSIGNER" sign \
+            --ks release.jks \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            --key-pass pass:"$KS_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out capcut_minimal_test.apk \
+            test_aligned.apk
+
+          "$APKSIGNER" verify -v capcut_minimal_test.apk | head -10
+          ls -la capcut_minimal_test.apk
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: capcut-minimal-test
+          path: capcut_minimal_test.apk
+          retention-days: 7
