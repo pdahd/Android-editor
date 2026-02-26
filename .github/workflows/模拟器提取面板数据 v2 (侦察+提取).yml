@@ -32,12 +32,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 生成测试视频
+      - name: 确认测试视频
         run: |
-          ffmpeg -f lavfi -i "color=c=blue:s=1080x1920:d=5:r=30" \
-            -vf "drawtext=text='TEST VIDEO':fontsize=60:fontcolor=white:x=(w-tw)/2:y=(h-th)/2" \
-            -c:v libx264 -pix_fmt yuv420p -y test_video.mp4
-          ls -la test_video.mp4
+          ls -la lv_0_20260226171438.mp4
+          echo "✅ 测试视频已就绪"
 
       - name: 模拟器侦察与提取
         uses: reactivecircus/android-emulator-runner@v2
@@ -79,11 +77,11 @@ jobs:
             done
             echo "✅ 权限已授予"
 
-            # 推送测试视频
-            adb push test_video.mp4 /sdcard/DCIM/test_video.mp4
+            # 推送真实测试视频
+            adb push lv_0_20260226171438.mp4 /sdcard/DCIM/test_video.mp4
             adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
               -d file:///sdcard/DCIM/test_video.mp4
-            sleep 2
+            sleep 3
             echo "✅ 测试视频已推送"
 
             echo "========== 阶段 2: 启动 App =========="
@@ -153,11 +151,11 @@ jobs:
             adb pull /sdcard/ui_current.xml output/ui_dumps/06_current.xml 2>/dev/null || true
 
             # 搜索 UI 中的可点击元素
-            echo "--- UI 中的可点击元素 ---"
+            echo "--- UI 中的文本元素 ---"
             if [ -f output/ui_dumps/06_current.xml ]; then
               grep -oP 'text="[^"]*"' output/ui_dumps/06_current.xml | sort -u | head -30 | tee output/logs/ui_texts.txt
               grep -oP 'content-desc="[^"]*"' output/ui_dumps/06_current.xml | sort -u | head -20 | tee output/logs/ui_descs.txt
-              # 查找 New Project / 新建项目 按钮的坐标
+              # 查找 New Project 按钮
               grep -iE "new.project|new.video|create|开始|start|编辑" output/ui_dumps/06_current.xml | tee output/logs/new_project_elements.txt || true
             fi
 
@@ -189,7 +187,6 @@ jobs:
 
             echo "========== 阶段 7: 尝试进入文字编辑 =========="
 
-            # 文字按钮通常在底部工具栏
             # 先搜索 UI
             adb shell uiautomator dump /sdcard/ui10.xml 2>/dev/null
             adb pull /sdcard/ui10.xml output/ui_dumps/10_editor.xml 2>/dev/null || true
@@ -197,7 +194,7 @@ jobs:
               grep -iE "text|字|font|subtitle|caption" output/ui_dumps/10_editor.xml | head -10 | tee output/logs/text_buttons.txt || true
             fi
 
-            # 尝试点击底部工具栏的各个位置（Text 通常在第3-4个位置）
+            # 尝试点击底部工具栏的各个位置
             TOOLBAR_Y=$((SCREEN_H - 80))
             for i in 1 2 3 4 5 6; do
               TAP_X=$((SCREEN_W * i / 7))
