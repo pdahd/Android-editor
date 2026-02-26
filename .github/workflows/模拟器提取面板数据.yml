@@ -1,4 +1,4 @@
-name: 模拟器提取面板数据 v6 (精确导航序列)
+name: 模拟器提取面板数据 v7 (完整导航修复)
 
 on:
   workflow_dispatch:
@@ -37,54 +37,61 @@ jobs:
 
       - name: 准备辅助脚本
         run: |
-          cat > tap_exact.py << 'PYEOF'
+          # tap_clickable.py: 只匹配 clickable=true
+          cat > tap_clickable.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
-          xml_path = sys.argv[1]
-          search_text = sys.argv[2]
-          try:
-              tree = ET.parse(xml_path)
-          except Exception:
-              sys.exit(1)
+          xml_path, search_text = sys.argv[1], sys.argv[2]
+          try: tree = ET.parse(xml_path)
+          except: sys.exit(1)
           for node in tree.iter('node'):
               text = node.get('text') or ''
               desc = node.get('content-desc') or ''
-              clickable = node.get('clickable', 'false')
-              if (text == search_text or desc == search_text) and clickable == 'true':
-                  bounds = node.get('bounds', '')
-                  m = re.findall(r'\d+', bounds)
+              if (text == search_text or desc == search_text) and node.get('clickable') == 'true':
+                  m = re.findall(r'\d+', node.get('bounds', ''))
                   if len(m) == 4:
-                      cx = (int(m[0]) + int(m[2])) // 2
-                      cy = (int(m[1]) + int(m[3])) // 2
-                      print(f"{cx} {cy}")
+                      print(f"{(int(m[0])+int(m[2]))//2} {(int(m[1])+int(m[3]))//2}")
                       sys.exit(0)
           sys.exit(1)
           PYEOF
 
-          cat > tap_contains.py << 'PYEOF'
+          # tap_any.py: 匹配任意元素（不要求 clickable）
+          cat > tap_any.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
-          xml_path = sys.argv[1]
-          search_text = sys.argv[2].lower()
-          try:
-              tree = ET.parse(xml_path)
-          except Exception:
-              sys.exit(1)
+          xml_path, search_text = sys.argv[1], sys.argv[2]
+          try: tree = ET.parse(xml_path)
+          except: sys.exit(1)
+          for node in tree.iter('node'):
+              text = node.get('text') or ''
+              desc = node.get('content-desc') or ''
+              if text == search_text or desc == search_text:
+                  m = re.findall(r'\d+', node.get('bounds', ''))
+                  if len(m) == 4:
+                      print(f"{(int(m[0])+int(m[2]))//2} {(int(m[1])+int(m[3]))//2}")
+                      sys.exit(0)
+          sys.exit(1)
+          PYEOF
+
+          # tap_contains_any.py: 模糊匹配任意元素
+          cat > tap_contains_any.py << 'PYEOF'
+          import xml.etree.ElementTree as ET
+          import re, sys
+          xml_path, search_text = sys.argv[1], sys.argv[2].lower()
+          try: tree = ET.parse(xml_path)
+          except: sys.exit(1)
           for node in tree.iter('node'):
               text = (node.get('text') or '').lower()
               desc = (node.get('content-desc') or '').lower()
-              clickable = node.get('clickable', 'false')
-              if clickable == 'true' and (search_text in text or search_text in desc):
-                  bounds = node.get('bounds', '')
-                  m = re.findall(r'\d+', bounds)
+              if search_text in text or search_text in desc:
+                  m = re.findall(r'\d+', node.get('bounds', ''))
                   if len(m) == 4:
-                      cx = (int(m[0]) + int(m[2])) // 2
-                      cy = (int(m[1]) + int(m[3])) // 2
-                      print(f"{cx} {cy}")
+                      print(f"{(int(m[0])+int(m[2]))//2} {(int(m[1])+int(m[3]))//2}")
                       sys.exit(0)
           sys.exit(1)
           PYEOF
 
+          # list_ui_helper.py
           cat > list_ui_helper.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
@@ -99,19 +106,25 @@ jobs:
                       m = re.findall(r'\d+', bounds)
                       cx = cy = 0
                       if len(m) == 4:
-                          cx = (int(m[0]) + int(m[2])) // 2
-                          cy = (int(m[1]) + int(m[3])) // 2
+                          cx = (int(m[0])+int(m[2]))//2
+                          cy = (int(m[1])+int(m[3]))//2
                       label = text if text else f"[desc:{desc}]"
                       print(f"  [{cx:>4},{cy:>4}] click={clickable:<5} \"{label}\"")
           except Exception as e:
               print(f"Error: {e}")
           PYEOF
 
+          # 主脚本
           cat > emu_script.sh << 'BASHEOF'
           #!/bin/bash
           set -x
 
           mkdir -p output/screenshots output/logs output/data output/ui_dumps
+
+          dump_ui() {
+            adb shell uiautomator dump /sdcard/ui_tap.xml 2>/dev/null
+            adb pull /sdcard/ui_tap.xml /tmp/ui_tap.xml 2>/dev/null
+          }
 
           snap() {
             adb shell screencap -p /sdcard/screen.png 2>/dev/null
@@ -120,28 +133,31 @@ jobs:
             adb pull /sdcard/ui.xml "output/ui_dumps/${1}.xml" 2>/dev/null || true
           }
 
-          tap_exact() {
-            adb shell uiautomator dump /sdcard/ui_tap.xml 2>/dev/null
-            adb pull /sdcard/ui_tap.xml /tmp/ui_tap.xml 2>/dev/null || return 1
+          # 精确匹配 clickable=true 的元素
+          tap_btn() {
+            dump_ui
             local coords
-            coords=$(python3 tap_exact.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
-            local cx=$(echo "$coords" | cut -d' ' -f1)
-            local cy=$(echo "$coords" | cut -d' ' -f2)
-            echo ">>> EXACT TAP '$1' at ${cx},${cy}"
-            adb shell input tap "$cx" "$cy"
-            return 0
+            coords=$(python3 tap_clickable.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
+            echo ">>> BTN '$1' at $coords"
+            adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
           }
 
-          tap_contains() {
-            adb shell uiautomator dump /sdcard/ui_tap.xml 2>/dev/null
-            adb pull /sdcard/ui_tap.xml /tmp/ui_tap.xml 2>/dev/null || return 1
+          # 精确匹配任意元素（包括 clickable=false）
+          tap_any() {
+            dump_ui
             local coords
-            coords=$(python3 tap_contains.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
-            local cx=$(echo "$coords" | cut -d' ' -f1)
-            local cy=$(echo "$coords" | cut -d' ' -f2)
-            echo ">>> CONTAINS TAP '$1' at ${cx},${cy}"
-            adb shell input tap "$cx" "$cy"
-            return 0
+            coords=$(python3 tap_any.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
+            echo ">>> ANY '$1' at $coords"
+            adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
+          }
+
+          # 模糊匹配任意元素
+          tap_fuzzy() {
+            dump_ui
+            local coords
+            coords=$(python3 tap_contains_any.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
+            echo ">>> FUZZY '$1' at $coords"
+            adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
           }
 
           list_ui() {
@@ -170,99 +186,122 @@ jobs:
           adb shell am force-stop com.google.android.apps.nexuslauncher 2>/dev/null || true
           sleep 2
 
-          echo "========== 阶段 2: 启动 App =========="
+          echo "========== 步骤 A: 启动 App =========="
           adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity
           sleep 25
           snap "01_launch"
           list_ui | tee output/logs/01_ui.txt
 
-          echo "========== 步骤 A: 同意服务条款 =========="
-          tap_exact "Agree and continue"
+          echo "========== 步骤 B: 同意服务条款 =========="
+          tap_btn "Agree and continue"
           sleep 5
           snap "02_after_agree"
           list_ui | tee output/logs/02_ui.txt
 
-          echo "========== 步骤 B: 跳过 Onboarding 1/2 =========="
-          tap_exact "Skip"
-          sleep 3
-          snap "03_after_skip1"
+          echo "========== 步骤 C: 跳过 Onboarding =========="
+          tap_btn "Skip"
+          sleep 5
+          snap "03_after_skip"
           list_ui | tee output/logs/03_ui.txt
 
-          echo "========== 步骤 C: 处理可能的 2/2 或其他弹窗 =========="
-          # 可能还有第二页 onboarding 或通知权限弹窗
-          tap_exact "Skip" || tap_exact "Not now" || tap_exact "Later" || \
-          tap_exact "Allow" || tap_exact "Don't allow" || tap_exact "Maybe later" || true
+          # 可能还有 2/2 页面
+          tap_btn "Skip" || true
           sleep 3
-          snap "04_after_popup1"
+
+          echo "========== 步骤 D: 关闭 Pro 弹窗 =========="
+          # Pro 弹窗右上角有 X 按钮，等几秒让它出现
+          sleep 5
+          snap "04_pro_popup"
           list_ui | tee output/logs/04_ui.txt
 
-          # 再处理一轮
-          tap_exact "Skip" || tap_exact "Not now" || tap_exact "Got it" || \
-          tap_exact "Allow" || tap_exact "Close" || tap_exact "Maybe later" || true
+          # 尝试按返回键关闭弹窗
+          adb shell input keyevent 4
           sleep 3
-          snap "05_after_popup2"
+          snap "05_after_back"
           list_ui | tee output/logs/05_ui.txt
 
-          # 再处理一轮（确保干净）
-          tap_exact "Skip" || tap_exact "Not now" || tap_exact "Got it" || \
-          tap_exact "Close" || tap_exact "Maybe later" || true
+          # 如果还在，再按一次返回
+          adb shell input keyevent 4
           sleep 3
 
-          echo "========== 步骤 D: 导航到 Edit 标签页 =========="
-          snap "06_before_edit"
+          echo "========== 步骤 E: 确保在 Edit 标签页 =========="
+          tap_btn "Edit"
+          sleep 3
+          snap "06_edit_tab"
           list_ui | tee output/logs/06_ui.txt
 
-          # v5 的 UI dump 显示底部导航栏: Edit[108,2297] Templates[324,2297] AI Lab[540,2297]
-          tap_exact "Edit" || tap_contains "edit" || true
-          sleep 5
-          snap "07_edit_tab"
+          # 再次关闭可能的弹窗
+          adb shell input keyevent 4
+          sleep 3
+          snap "07_clean_edit"
           list_ui | tee output/logs/07_ui.txt
 
-          echo "========== 步骤 E: 点击 New Project =========="
-          tap_exact "New project" || tap_contains "new project" || true
+          echo "========== 步骤 F: 点击 New video =========="
+          # 主页按钮标记为 click=false，用 tap_any 匹配
+          tap_any "New video" || tap_fuzzy "new video" || true
           sleep 5
-          snap "08_new_project"
+          snap "08_new_video"
           list_ui | tee output/logs/08_ui.txt
 
-          # 处理可能弹出的权限对话框
-          tap_exact "Allow" || tap_exact "While using the app" || true
+          # 处理可能的存储权限弹窗
+          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
           sleep 3
           snap "09_after_perm"
           list_ui | tee output/logs/09_ui.txt
 
-          echo "========== 步骤 F: 选择视频 =========="
-          # 可能需要切换到 Videos 标签
-          tap_exact "Videos" || tap_contains "video" || true
+          # 再处理一轮权限
+          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
           sleep 3
-          snap "10_videos_tab"
+
+          echo "========== 步骤 G: 选择视频 =========="
+          snap "10_video_list"
           list_ui | tee output/logs/10_ui.txt
 
-          # 点击第一个视频缩略图（通常在左上区域）
-          # 根据典型布局，视频列表从 y≈500 开始
-          adb shell input tap 270 700
+          # 切换到 Videos 标签（如果有）
+          tap_btn "Videos" || tap_any "Videos" || tap_fuzzy "video" || true
           sleep 3
-          snap "11_video_tapped"
+          snap "11_videos_tab"
           list_ui | tee output/logs/11_ui.txt
 
-          # 点击右下角 Add 按钮
-          tap_exact "Add" || tap_contains "add" || true
-          sleep 10
-          snap "12_editor"
+          # 点击视频缩略图右上角的勾选圆圈
+          # 典型位置：第一个缩略图在 ~(200-300, 500-800) 区域
+          # 点击缩略图右上角（勾选区域）
+          adb shell input tap 350 550
+          sleep 2
+          snap "12_video_check1"
           list_ui | tee output/logs/12_ui.txt
 
-          echo "========== 步骤 G: 进入文字/字幕编辑 =========="
-          # 处理可能的引导提示
-          tap_exact "Got it" || tap_exact "Skip" || tap_exact "OK" || true
+          # 如果上面没选中，试试直接点击缩略图中心
+          adb shell input tap 270 650
           sleep 2
-
-          # 编辑器底部工具栏应该有 Text
-          tap_exact "Text" || tap_contains "text" || true
-          sleep 3
-          snap "13_text"
+          snap "13_video_check2"
           list_ui | tee output/logs/13_ui.txt
 
-          # 点击 Add text
-          tap_exact "Add text" || tap_exact "Add Text" || tap_contains "add text" || true
+          echo "========== 步骤 H: 点击 Add 按钮 =========="
+          # Add 按钮可能显示 "Add" 或 "Add (1)"
+          tap_btn "Add" || tap_fuzzy "add" || tap_any "Add" || tap_any "Add (1)" || true
+          sleep 10
+          snap "14_editor"
+          list_ui | tee output/logs/14_ui.txt
+
+          # 处理编辑器引导提示
+          tap_btn "Got it" || tap_btn "OK" || tap_btn "Skip" || true
+          sleep 3
+          tap_btn "Got it" || tap_btn "OK" || true
+          sleep 2
+
+          echo "========== 步骤 I: 点击 Text =========="
+          snap "15_before_text"
+          list_ui | tee output/logs/15_ui.txt
+
+          # Text 按钮在编辑器底部工具栏
+          tap_any "Text" || tap_btn "Text" || tap_fuzzy "text" || true
+          sleep 3
+          snap "16_text_menu"
+          list_ui | tee output/logs/16_ui.txt
+
+          echo "========== 步骤 J: 点击 Add text =========="
+          tap_any "Add text" || tap_btn "Add text" || tap_fuzzy "add text" || true
           sleep 3
 
           # 关闭键盘
@@ -270,68 +309,57 @@ jobs:
           sleep 2
 
           # 处理引导
-          tap_exact "Got it" || tap_exact "OK" || true
+          tap_btn "Got it" || tap_btn "OK" || true
           sleep 2
-          snap "14_text_added"
-          list_ui | tee output/logs/14_ui.txt
+          snap "17_text_added"
+          list_ui | tee output/logs/17_ui.txt
 
-          echo "========== 步骤 H: 遍历字幕面板（触发 API 加载）=========="
-          for panel in Templates Fonts Effects Animations Bubble; do
+          echo "========== 步骤 K: 遍历字幕面板（触发 API）=========="
+          for panel in Templates Fonts Effects Animations Bubble Presets; do
             echo "===== 点击面板: $panel ====="
-            tap_exact "$panel" || tap_contains "$panel" || true
+            tap_any "$panel" || tap_btn "$panel" || tap_fuzzy "$panel" || true
             sleep 10
-            snap "15_panel_${panel}"
-            list_ui | tee "output/logs/15_panel_${panel}.txt"
-            echo "--- 检查 effectchannel ---"
-            adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" || echo "无"
+            snap "18_panel_${panel}"
+            list_ui | tee "output/logs/18_panel_${panel}.txt"
+            echo "--- effectchannel 检查 ---"
+            adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" || echo "无 effectchannel"
           done
 
-          echo "========== 步骤 I: 等待 API 完成 =========="
-          echo "等待 120 秒让所有面板数据加载..."
+          echo "========== 步骤 L: 等待 API 完成 =========="
+          echo "等待 120 秒..."
           sleep 120
 
           echo "========== 最终数据提取 =========="
-          echo "--- effect 目录 ---"
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/final_effect_dir.txt
-
-          echo "--- effectchannel ---"
           adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 \( -name 'effectchannel*' -o -name 'effect_version*' \) -exec ls -la {} \;" 2>/dev/null | tee output/logs/final_channels.txt
-
-          echo "--- rp.db ---"
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null" | tee output/logs/final_rpdb.txt
 
-          # 提取 rp.db
           adb pull /data/data/com.lemon.lvoverseas/files/resources/db/rp.db output/data/rp_official.db 2>/dev/null || echo "rp.db 不存在"
 
-          # 提取所有 effectchannel 文件
           for f in $(adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 -name 'effectchannel*' 2>/dev/null" | tr -d '\r'); do
             fname=$(basename "$f")
-            echo "提取: $fname"
             adb pull "$f" "output/data/${fname}" 2>/dev/null || true
           done
 
-          # 提取 effect_version 文件
           for f in $(adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 -name 'effect_version*' 2>/dev/null" | tr -d '\r'); do
             fname=$(basename "$f")
-            echo "提取: $fname"
             adb pull "$f" "output/data/${fname}" 2>/dev/null || true
           done
 
           echo "--- 日志分析 ---"
           adb logcat -d > output/logs/full_logcat.txt 2>/dev/null
-
           grep -i "respool" output/logs/full_logcat.txt 2>/dev/null | tail -80 | tee output/logs/respool_calls.txt || true
           grep -iE "effect.*panel|category/effects|get_panel_info" output/logs/full_logcat.txt 2>/dev/null | tail -50 | tee output/logs/effect_api.txt || true
           grep -i "shark" output/logs/full_logcat.txt 2>/dev/null | tee output/logs/shark_check.txt || true
           grep -iE "network.*fail|body is empty|fetch.*failed" output/logs/full_logcat.txt 2>/dev/null | tail -30 | tee output/logs/network_errors.txt || true
-          grep -iE "panel.*info|panel.*category|subtitle.template|flower|bubble|text.*anim" output/logs/full_logcat.txt 2>/dev/null | tail -50 | tee output/logs/panel_activity.txt || true
+          grep -iE "panel.*info|subtitle.template|flower|bubble|text.*anim" output/logs/full_logcat.txt 2>/dev/null | tail -50 | tee output/logs/panel_activity.txt || true
 
           if [ -f output/data/rp_official.db ]; then
-            echo "=== rp.db 面板信息 ==="
+            echo "=== rp.db 面板 ==="
             sqlite3 -header -column output/data/rp_official.db "SELECT name, version FROM panel_info;" 2>/dev/null | tee output/logs/rpdb_panels.txt || true
-            echo "=== rp.db 分类统计 ==="
+            echo "=== rp.db 分类 ==="
             sqlite3 -header -column output/data/rp_official.db "SELECT panel, COUNT(*) as cats FROM panel_category GROUP BY panel;" 2>/dev/null | tee output/logs/rpdb_categories.txt || true
-            echo "=== rp.db 特效总数 ==="
+            echo "=== rp.db 特效数 ==="
             sqlite3 -header -column output/data/rp_official.db "SELECT COUNT(*) as total FROM effect;" 2>/dev/null | tee output/logs/rpdb_effects.txt || true
           fi
 
@@ -362,6 +390,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-recon-v6
+          name: emulator-recon-v7
           path: output/
           retention-days: 7
