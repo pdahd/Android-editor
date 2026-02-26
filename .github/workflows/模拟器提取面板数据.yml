@@ -1,4 +1,4 @@
-name: 模拟器提取面板数据 v7 (完整导航修复)
+name: 模拟器提取面板数据 v8 (精确坐标导航)
 
 on:
   workflow_dispatch:
@@ -37,7 +37,6 @@ jobs:
 
       - name: 准备辅助脚本
         run: |
-          # tap_clickable.py: 只匹配 clickable=true
           cat > tap_clickable.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
@@ -55,7 +54,6 @@ jobs:
           sys.exit(1)
           PYEOF
 
-          # tap_any.py: 匹配任意元素（不要求 clickable）
           cat > tap_any.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
@@ -73,7 +71,6 @@ jobs:
           sys.exit(1)
           PYEOF
 
-          # tap_contains_any.py: 模糊匹配任意元素
           cat > tap_contains_any.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
@@ -91,7 +88,6 @@ jobs:
           sys.exit(1)
           PYEOF
 
-          # list_ui_helper.py
           cat > list_ui_helper.py << 'PYEOF'
           import xml.etree.ElementTree as ET
           import re, sys
@@ -114,7 +110,6 @@ jobs:
               print(f"Error: {e}")
           PYEOF
 
-          # 主脚本
           cat > emu_script.sh << 'BASHEOF'
           #!/bin/bash
           set -x
@@ -133,7 +128,6 @@ jobs:
             adb pull /sdcard/ui.xml "output/ui_dumps/${1}.xml" 2>/dev/null || true
           }
 
-          # 精确匹配 clickable=true 的元素
           tap_btn() {
             dump_ui
             local coords
@@ -142,7 +136,6 @@ jobs:
             adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
           }
 
-          # 精确匹配任意元素（包括 clickable=false）
           tap_any() {
             dump_ui
             local coords
@@ -151,7 +144,6 @@ jobs:
             adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
           }
 
-          # 模糊匹配任意元素
           tap_fuzzy() {
             dump_ui
             local coords
@@ -186,167 +178,141 @@ jobs:
           adb shell am force-stop com.google.android.apps.nexuslauncher 2>/dev/null || true
           sleep 2
 
-          echo "========== 步骤 A: 启动 App =========="
+          echo "========== A: 启动 =========="
           adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity
           sleep 25
           snap "01_launch"
           list_ui | tee output/logs/01_ui.txt
 
-          echo "========== 步骤 B: 同意服务条款 =========="
+          echo "========== B: 同意条款 =========="
           tap_btn "Agree and continue"
           sleep 5
-          snap "02_after_agree"
+          snap "02_agree"
           list_ui | tee output/logs/02_ui.txt
 
-          echo "========== 步骤 C: 跳过 Onboarding =========="
+          echo "========== C: 跳过引导 =========="
           tap_btn "Skip"
           sleep 5
-          snap "03_after_skip"
-          list_ui | tee output/logs/03_ui.txt
-
-          # 可能还有 2/2 页面
+          # 可能还有第二页引导
           tap_btn "Skip" || true
           sleep 3
+          snap "03_skip"
+          list_ui | tee output/logs/03_ui.txt
 
-          echo "========== 步骤 D: 关闭 Pro 弹窗 =========="
-          # Pro 弹窗右上角有 X 按钮，等几秒让它出现
+          echo "========== D: 关闭 Pro 弹窗 =========="
+          # Pro 弹窗可能出现也可能不出现，用返回键关闭
           sleep 5
-          snap "04_pro_popup"
+          adb shell input keyevent 4
+          sleep 3
+          adb shell input keyevent 4
+          sleep 3
+          snap "04_pro_closed"
           list_ui | tee output/logs/04_ui.txt
 
-          # 尝试按返回键关闭弹窗
-          adb shell input keyevent 4
-          sleep 3
-          snap "05_after_back"
-          list_ui | tee output/logs/05_ui.txt
-
-          # 如果还在，再按一次返回
-          adb shell input keyevent 4
-          sleep 3
-
-          echo "========== 步骤 E: 确保在 Edit 标签页 =========="
+          echo "========== E: 切换到 Edit 标签 =========="
+          # 应用自动导航到 Templates 标签，我们需要点 Edit
           tap_btn "Edit"
           sleep 3
-          snap "06_edit_tab"
-          list_ui | tee output/logs/06_ui.txt
+          snap "05_edit_tab"
+          list_ui | tee output/logs/05_ui.txt
 
-          # 再次关闭可能的弹窗
+          # 关闭可能的弹窗
           adb shell input keyevent 4
           sleep 3
-          snap "07_clean_edit"
+          snap "06_edit_clean"
+          list_ui | tee output/logs/06_ui.txt
+
+          echo "========== F: 点击 New video =========="
+          tap_any "New video"
+          sleep 5
+          snap "07_new_video"
           list_ui | tee output/logs/07_ui.txt
 
-          echo "========== 步骤 F: 点击 New video =========="
-          # 主页按钮标记为 click=false，用 tap_any 匹配
-          tap_any "New video" || tap_fuzzy "new video" || true
-          sleep 5
-          snap "08_new_video"
+          # 处理权限弹窗
+          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
+          sleep 3
+          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
+          sleep 3
+          snap "08_after_perm"
           list_ui | tee output/logs/08_ui.txt
 
-          # 处理可能的存储权限弹窗
-          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
-          sleep 3
-          snap "09_after_perm"
+          echo "========== G: 选择视频 =========="
+          # ❶ 勾选视频（右上角小圆圈）
+          echo ">>> 勾选视频 at 226,426"
+          adb shell input tap 226 426
+          sleep 2
+          snap "09_video_checked"
           list_ui | tee output/logs/09_ui.txt
 
-          # 再处理一轮权限
-          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
-          sleep 3
-
-          echo "========== 步骤 G: 选择视频 =========="
-          snap "10_video_list"
+          # ❷ 勾选 HD
+          echo ">>> 勾选 HD at 944,1931"
+          adb shell input tap 944 1931
+          sleep 2
+          snap "10_hd_checked"
           list_ui | tee output/logs/10_ui.txt
 
-          # 切换到 Videos 标签（如果有）
-          tap_btn "Videos" || tap_any "Videos" || tap_fuzzy "video" || true
-          sleep 3
-          snap "11_videos_tab"
+          # ❸ 点击 Add (1)
+          echo ">>> 点击 Add"
+          tap_btn "Add" || tap_any "Add" || tap_fuzzy "add" || tap_any "Add (1)" || true
+          sleep 15
+          snap "11_editor_loading"
           list_ui | tee output/logs/11_ui.txt
 
-          # 点击视频缩略图右上角的勾选圆圈
-          # 典型位置：第一个缩略图在 ~(200-300, 500-800) 区域
-          # 点击缩略图右上角（勾选区域）
-          adb shell input tap 350 550
-          sleep 2
-          snap "12_video_check1"
-          list_ui | tee output/logs/12_ui.txt
-
-          # 如果上面没选中，试试直接点击缩略图中心
-          adb shell input tap 270 650
-          sleep 2
-          snap "13_video_check2"
-          list_ui | tee output/logs/13_ui.txt
-
-          echo "========== 步骤 H: 点击 Add 按钮 =========="
-          # Add 按钮可能显示 "Add" 或 "Add (1)"
-          tap_btn "Add" || tap_fuzzy "add" || tap_any "Add" || tap_any "Add (1)" || true
-          sleep 10
-          snap "14_editor"
-          list_ui | tee output/logs/14_ui.txt
-
-          # 处理编辑器引导提示
+          echo "========== H: 编辑器 =========="
+          # 处理引导提示
           tap_btn "Got it" || tap_btn "OK" || tap_btn "Skip" || true
           sleep 3
           tap_btn "Got it" || tap_btn "OK" || true
+          sleep 3
+          tap_btn "Got it" || tap_btn "OK" || true
           sleep 2
+          snap "12_editor"
+          list_ui | tee output/logs/12_ui.txt
 
-          echo "========== 步骤 I: 点击 Text =========="
-          snap "15_before_text"
-          list_ui | tee output/logs/15_ui.txt
-
-          # Text 按钮在编辑器底部工具栏
+          echo "========== I: 点击 Text =========="
           tap_any "Text" || tap_btn "Text" || tap_fuzzy "text" || true
           sleep 3
-          snap "16_text_menu"
-          list_ui | tee output/logs/16_ui.txt
+          snap "13_text_menu"
+          list_ui | tee output/logs/13_ui.txt
 
-          echo "========== 步骤 J: 点击 Add text =========="
+          echo "========== J: 点击 Add text =========="
           tap_any "Add text" || tap_btn "Add text" || tap_fuzzy "add text" || true
           sleep 3
-
           # 关闭键盘
           adb shell input keyevent 4
           sleep 2
-
           # 处理引导
           tap_btn "Got it" || tap_btn "OK" || true
           sleep 2
-          snap "17_text_added"
-          list_ui | tee output/logs/17_ui.txt
+          snap "14_text_added"
+          list_ui | tee output/logs/14_ui.txt
 
-          echo "========== 步骤 K: 遍历字幕面板（触发 API）=========="
-          for panel in Templates Fonts Effects Animations Bubble Presets; do
-            echo "===== 点击面板: $panel ====="
+          echo "========== K: 遍历字幕面板 =========="
+          for panel in Templates Fonts Effects Animations Bubble Presets Styles; do
+            echo "===== 面板: $panel ====="
             tap_any "$panel" || tap_btn "$panel" || tap_fuzzy "$panel" || true
             sleep 10
-            snap "18_panel_${panel}"
-            list_ui | tee "output/logs/18_panel_${panel}.txt"
-            echo "--- effectchannel 检查 ---"
-            adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" || echo "无 effectchannel"
+            snap "15_${panel}"
+            list_ui | tee "output/logs/15_${panel}.txt"
+            echo "--- effectchannel ---"
+            adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" || echo "无"
           done
 
-          echo "========== 步骤 L: 等待 API 完成 =========="
-          echo "等待 120 秒..."
+          echo "========== L: 等待 API 120秒 =========="
           sleep 120
 
-          echo "========== 最终数据提取 =========="
+          echo "========== 最终提取 =========="
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/final_effect_dir.txt
           adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 \( -name 'effectchannel*' -o -name 'effect_version*' \) -exec ls -la {} \;" 2>/dev/null | tee output/logs/final_channels.txt
           adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null" | tee output/logs/final_rpdb.txt
 
           adb pull /data/data/com.lemon.lvoverseas/files/resources/db/rp.db output/data/rp_official.db 2>/dev/null || echo "rp.db 不存在"
 
-          for f in $(adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 -name 'effectchannel*' 2>/dev/null" | tr -d '\r'); do
+          for f in $(adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 \( -name 'effectchannel*' -o -name 'effect_version*' \) 2>/dev/null" | tr -d '\r'); do
             fname=$(basename "$f")
             adb pull "$f" "output/data/${fname}" 2>/dev/null || true
           done
 
-          for f in $(adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 -name 'effect_version*' 2>/dev/null" | tr -d '\r'); do
-            fname=$(basename "$f")
-            adb pull "$f" "output/data/${fname}" 2>/dev/null || true
-          done
-
-          echo "--- 日志分析 ---"
           adb logcat -d > output/logs/full_logcat.txt 2>/dev/null
           grep -i "respool" output/logs/full_logcat.txt 2>/dev/null | tail -80 | tee output/logs/respool_calls.txt || true
           grep -iE "effect.*panel|category/effects|get_panel_info" output/logs/full_logcat.txt 2>/dev/null | tail -50 | tee output/logs/effect_api.txt || true
@@ -390,6 +356,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-recon-v7
+          name: emulator-recon-v8
           path: output/
           retention-days: 7
