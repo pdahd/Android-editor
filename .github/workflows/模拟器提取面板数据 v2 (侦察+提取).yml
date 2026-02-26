@@ -33,9 +33,156 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 确认测试视频
+        run: ls -la lv_0_20260226171438.mp4
+
+      - name: 准备模拟器脚本
         run: |
-          ls -la lv_0_20260226171438.mp4
-          echo "✅ 测试视频已就绪"
+          cat > emu_script.sh << 'EOFSCRIPT'
+          #!/bin/bash
+          set -x
+
+          mkdir -p output/screenshots output/logs output/data output/ui_dumps
+
+          snap() {
+            adb shell screencap -p /sdcard/screen.png
+            adb pull /sdcard/screen.png "output/screenshots/${1}.png" 2>/dev/null || true
+            adb shell uiautomator dump /sdcard/ui.xml 2>/dev/null
+            adb pull /sdcard/ui.xml "output/ui_dumps/${1}.xml" 2>/dev/null || true
+          }
+
+          echo "========== 阶段 1: 安装与初始化 =========="
+          adb install -t official.apk
+          adb root
+          sleep 5
+
+          for perm in READ_EXTERNAL_STORAGE WRITE_EXTERNAL_STORAGE READ_MEDIA_VIDEO \
+                      READ_MEDIA_IMAGES READ_MEDIA_AUDIO CAMERA RECORD_AUDIO \
+                      POST_NOTIFICATIONS; do
+            adb shell pm grant com.lemon.lvoverseas "android.permission.${perm}" 2>/dev/null || true
+          done
+
+          adb push lv_0_20260226171438.mp4 /sdcard/DCIM/test_video.mp4
+          adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
+            -d file:///sdcard/DCIM/test_video.mp4
+          sleep 3
+
+          echo "========== 阶段 2: 启动 App =========="
+          adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity
+          sleep 20
+          snap "01_app_launch"
+
+          SCREEN_SIZE=$(adb shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1)
+          SCREEN_W=$(echo $SCREEN_SIZE | cut -d'x' -f1)
+          SCREEN_H=$(echo $SCREEN_SIZE | cut -d'x' -f2)
+          CENTER_X=$((SCREEN_W / 2))
+          CENTER_Y=$((SCREEN_H / 2))
+          echo "屏幕: ${SCREEN_W}x${SCREEN_H} 中心: ${CENTER_X},${CENTER_Y}"
+
+          echo "========== 阶段 3: 尝试通过引导页 =========="
+          adb shell input tap $CENTER_X $((SCREEN_H - 200))
+          sleep 3
+          snap "02_after_bottom_tap"
+
+          adb shell input tap $CENTER_X $((SCREEN_H - 200))
+          sleep 3
+          snap "03_after_second_tap"
+
+          adb shell input tap $((SCREEN_W - 100)) 150
+          sleep 3
+          snap "04_after_skip_tap"
+
+          adb shell input tap $CENTER_X $((SCREEN_H - 300))
+          sleep 3
+          snap "05_after_third_bottom"
+
+          echo "========== 阶段 4: 等待后台数据下载 =========="
+          echo "等待 90 秒..."
+          sleep 90
+          snap "06_after_long_wait"
+
+          echo "========== 阶段 5: 检查已下载的数据 =========="
+          adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/effect_dir.txt
+          adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" | tee output/logs/effectchannel.txt
+          adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/ 2>/dev/null" | tee output/logs/db_dir.txt
+          adb shell "ls /data/data/com.lemon.lvoverseas/shared_prefs/ 2>/dev/null" | tee output/logs/shared_prefs.txt
+
+          echo "========== 阶段 6: 尝试导航到编辑器 =========="
+          adb shell uiautomator dump /sdcard/ui_current.xml 2>/dev/null
+          adb pull /sdcard/ui_current.xml output/ui_dumps/06_current.xml 2>/dev/null || true
+
+          if [ -f output/ui_dumps/06_current.xml ]; then
+            grep -oP 'text="[^"]*"' output/ui_dumps/06_current.xml | sort -u | head -30 | tee output/logs/ui_texts.txt
+            grep -oP 'content-desc="[^"]*"' output/ui_dumps/06_current.xml | sort -u | head -20 | tee output/logs/ui_descs.txt
+            grep -iE "new.project|new.video|create|start" output/ui_dumps/06_current.xml | tee output/logs/new_project_elements.txt || true
+          fi
+
+          adb shell input tap $CENTER_X $((CENTER_Y - 200))
+          sleep 5
+          snap "07_after_new_project_tap"
+
+          adb shell uiautomator dump /sdcard/ui7.xml 2>/dev/null
+          adb pull /sdcard/ui7.xml output/ui_dumps/07_video_select.xml 2>/dev/null || true
+          if [ -f output/ui_dumps/07_video_select.xml ]; then
+            grep -iE "video|test|select|choose" output/ui_dumps/07_video_select.xml | head -10 | tee output/logs/video_select.txt || true
+          fi
+
+          adb shell input tap 200 600
+          sleep 3
+          snap "08_after_video_select"
+
+          adb shell input tap $((SCREEN_W - 100)) $((SCREEN_H - 100))
+          sleep 5
+          snap "09_after_add_video"
+
+          sleep 10
+          snap "10_editor_loaded"
+
+          echo "========== 阶段 7: 尝试进入文字编辑 =========="
+          adb shell uiautomator dump /sdcard/ui10.xml 2>/dev/null
+          adb pull /sdcard/ui10.xml output/ui_dumps/10_editor.xml 2>/dev/null || true
+          if [ -f output/ui_dumps/10_editor.xml ]; then
+            grep -iE "text|font|subtitle|caption" output/ui_dumps/10_editor.xml | head -10 | tee output/logs/text_buttons.txt || true
+          fi
+
+          TOOLBAR_Y=$((SCREEN_H - 80))
+          for i in 1 2 3 4 5 6; do
+            TAP_X=$((SCREEN_W * i / 7))
+            adb shell input tap $TAP_X $TOOLBAR_Y
+            sleep 2
+          done
+          snap "11_after_toolbar_taps"
+
+          echo "========== 阶段 8: 最终数据提取 =========="
+          sleep 30
+
+          adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/final_effect_dir.txt
+          adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 -name 'effectchannel*' -o -name 'effect_version*' 2>/dev/null" | tee output/logs/final_channels.txt
+          adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null" | tee output/logs/final_rpdb.txt
+
+          adb pull /data/data/com.lemon.lvoverseas/files/resources/db/rp.db output/data/rp_official.db 2>/dev/null || echo "rp.db 不存在"
+
+          for f in $(adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" | tr -d '\r'); do
+            fname=$(basename "$f")
+            adb pull "$f" "output/data/${fname}" 2>/dev/null || true
+          done
+
+          adb shell "cat /data/data/com.lemon.lvoverseas/shared_prefs/tt_device_info.xml" > output/logs/device_info.xml 2>/dev/null || true
+          adb shell "cat /data/data/com.lemon.lvoverseas/shared_prefs/ep_sp_config.xml" > output/logs/ep_config.xml 2>/dev/null || true
+
+          echo "========== 阶段 9: API 调用日志 =========="
+          adb logcat -d > output/logs/full_logcat.txt 2>/dev/null
+
+          grep -i "respool" output/logs/full_logcat.txt | tail -50 | tee output/logs/respool_calls.txt
+          grep -iE "effect.*panel|category/effects|get_panel_info" output/logs/full_logcat.txt | tail -30 | tee output/logs/effect_api.txt
+          grep -i "shark" output/logs/full_logcat.txt | tee output/logs/shark_check.txt
+          grep -iE "network.*fail|body is empty|fetch.*failed" output/logs/full_logcat.txt | tail -20 | tee output/logs/network_errors.txt
+
+          echo "========== 完成 =========="
+          echo "截图: $(ls output/screenshots/ 2>/dev/null | wc -l)"
+          echo "日志: $(ls output/logs/ 2>/dev/null | wc -l)"
+          echo "数据: $(ls output/data/ 2>/dev/null | wc -l)"
+          EOFSCRIPT
+          chmod +x emu_script.sh
 
       - name: 模拟器侦察与提取
         uses: reactivecircus/android-emulator-runner@v2
@@ -48,214 +195,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
           disable-animations: true
           emulator-boot-timeout: 300
-          script: |
-            mkdir -p output/screenshots output/logs output/data output/ui_dumps
-
-            take_snapshot() {
-              local step="$1"
-              local desc="$2"
-              echo "--- Snapshot: ${step} - ${desc} ---"
-              adb shell screencap -p /sdcard/screen.png
-              adb pull /sdcard/screen.png "output/screenshots/${step}_${desc}.png" 2>/dev/null || true
-              adb shell uiautomator dump /sdcard/ui.xml 2>/dev/null
-              adb pull /sdcard/ui.xml "output/ui_dumps/${step}_${desc}.xml" 2>/dev/null || true
-            }
-
-            echo "========== 阶段 1: 安装与初始化 =========="
-            adb install -t official.apk
-            echo "✅ 安装成功"
-
-            adb root
-            sleep 5
-            echo "✅ adb root 已启用"
-
-            # 预先授予所有权限
-            for perm in READ_EXTERNAL_STORAGE WRITE_EXTERNAL_STORAGE READ_MEDIA_VIDEO \
-                        READ_MEDIA_IMAGES READ_MEDIA_AUDIO CAMERA RECORD_AUDIO \
-                        POST_NOTIFICATIONS; do
-              adb shell pm grant com.lemon.lvoverseas "android.permission.${perm}" 2>/dev/null || true
-            done
-            echo "✅ 权限已授予"
-
-            # 推送真实测试视频
-            adb push lv_0_20260226171438.mp4 /sdcard/DCIM/test_video.mp4
-            adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
-              -d file:///sdcard/DCIM/test_video.mp4
-            sleep 3
-            echo "✅ 测试视频已推送"
-
-            echo "========== 阶段 2: 启动 App =========="
-            adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity
-            sleep 20
-            take_snapshot "01" "app_launch"
-
-            # 获取屏幕尺寸
-            SCREEN_SIZE=$(adb shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1)
-            echo "屏幕尺寸: $SCREEN_SIZE"
-            SCREEN_W=$(echo $SCREEN_SIZE | cut -d'x' -f1)
-            SCREEN_H=$(echo $SCREEN_SIZE | cut -d'x' -f2)
-            CENTER_X=$((SCREEN_W / 2))
-            CENTER_Y=$((SCREEN_H / 2))
-            echo "中心坐标: ${CENTER_X},${CENTER_Y}"
-
-            echo "========== 阶段 3: 尝试通过引导页 =========="
-
-            # 尝试点击常见的 "Agree" / "Accept" / "Skip" 按钮位置
-            # 底部中间区域
-            adb shell input tap $CENTER_X $((SCREEN_H - 200))
-            sleep 3
-            take_snapshot "02" "after_bottom_tap"
-
-            # 再点一次（可能有多个引导页）
-            adb shell input tap $CENTER_X $((SCREEN_H - 200))
-            sleep 3
-            take_snapshot "03" "after_second_tap"
-
-            # 尝试右上角跳过按钮
-            adb shell input tap $((SCREEN_W - 100)) 150
-            sleep 3
-            take_snapshot "04" "after_skip_tap"
-
-            # 再次底部
-            adb shell input tap $CENTER_X $((SCREEN_H - 300))
-            sleep 3
-            take_snapshot "05" "after_third_bottom"
-
-            echo "========== 阶段 4: 等待后台数据下载 =========="
-            echo "等待 90 秒让 App 完成初始化和后台下载..."
-            sleep 90
-
-            take_snapshot "06" "after_long_wait"
-
-            echo "========== 阶段 5: 检查已下载的数据 =========="
-
-            echo "--- effect 目录 ---"
-            adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/effect_dir.txt
-
-            echo ""
-            echo "--- effectchannel 文件 ---"
-            adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" | tee output/logs/effectchannel.txt
-
-            echo ""
-            echo "--- resources/db 目录 ---"
-            adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/ 2>/dev/null" | tee output/logs/db_dir.txt
-
-            echo ""
-            echo "--- shared_prefs 文件列表 ---"
-            adb shell "ls /data/data/com.lemon.lvoverseas/shared_prefs/ 2>/dev/null" | tee output/logs/shared_prefs.txt
-
-            echo "========== 阶段 6: 尝试导航到编辑器 =========="
-
-            # 尝试在 UI dump 中找到 "New Project" 按钮
-            adb shell uiautomator dump /sdcard/ui_current.xml 2>/dev/null
-            adb pull /sdcard/ui_current.xml output/ui_dumps/06_current.xml 2>/dev/null || true
-
-            # 搜索 UI 中的可点击元素
-            echo "--- UI 中的文本元素 ---"
-            if [ -f output/ui_dumps/06_current.xml ]; then
-              grep -oP 'text="[^"]*"' output/ui_dumps/06_current.xml | sort -u | head -30 | tee output/logs/ui_texts.txt
-              grep -oP 'content-desc="[^"]*"' output/ui_dumps/06_current.xml | sort -u | head -20 | tee output/logs/ui_descs.txt
-              # 查找 New Project 按钮
-              grep -iE "new.project|new.video|create|开始|start|编辑" output/ui_dumps/06_current.xml | tee output/logs/new_project_elements.txt || true
-            fi
-
-            # 尝试点击 "New Project"（通常在主页面中上部）
-            adb shell input tap $CENTER_X $((CENTER_Y - 200))
-            sleep 5
-            take_snapshot "07" "after_new_project_tap"
-
-            # 如果进入了视频选择页面，尝试选择视频
-            adb shell uiautomator dump /sdcard/ui7.xml 2>/dev/null
-            adb pull /sdcard/ui7.xml output/ui_dumps/07_video_select.xml 2>/dev/null || true
-            if [ -f output/ui_dumps/07_video_select.xml ]; then
-              grep -iE "video|test|select|choose" output/ui_dumps/07_video_select.xml | head -10 | tee output/logs/video_select.txt || true
-            fi
-
-            # 尝试点击视频缩略图（通常在列表第一个位置）
-            adb shell input tap 200 600
-            sleep 3
-            take_snapshot "08" "after_video_select"
-
-            # 尝试点击 "Add" / "Next" / 下一步
-            adb shell input tap $((SCREEN_W - 100)) $((SCREEN_H - 100))
-            sleep 5
-            take_snapshot "09" "after_add_video"
-
-            # 等待编辑器加载
-            sleep 10
-            take_snapshot "10" "editor_loaded"
-
-            echo "========== 阶段 7: 尝试进入文字编辑 =========="
-
-            # 先搜索 UI
-            adb shell uiautomator dump /sdcard/ui10.xml 2>/dev/null
-            adb pull /sdcard/ui10.xml output/ui_dumps/10_editor.xml 2>/dev/null || true
-            if [ -f output/ui_dumps/10_editor.xml ]; then
-              grep -iE "text|字|font|subtitle|caption" output/ui_dumps/10_editor.xml | head -10 | tee output/logs/text_buttons.txt || true
-            fi
-
-            # 尝试点击底部工具栏的各个位置
-            TOOLBAR_Y=$((SCREEN_H - 80))
-            for i in 1 2 3 4 5 6; do
-              TAP_X=$((SCREEN_W * i / 7))
-              adb shell input tap $TAP_X $TOOLBAR_Y
-              sleep 2
-            done
-            take_snapshot "11" "after_toolbar_taps"
-
-            echo "========== 阶段 8: 最终数据提取 =========="
-
-            # 再等一会让可能的 API 调用完成
-            sleep 30
-
-            echo "--- 最终 effect 目录 ---"
-            adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/final_effect_dir.txt
-
-            echo ""
-            echo "--- 最终 effectchannel 文件 ---"
-            adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 -name 'effectchannel*' -o -name 'effect_version*' 2>/dev/null" | tee output/logs/final_channels.txt
-
-            echo ""
-            echo "--- 最终 rp.db ---"
-            adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null" | tee output/logs/final_rpdb.txt
-
-            # 提取所有有价值的数据
-            echo "--- 提取 rp.db ---"
-            adb pull /data/data/com.lemon.lvoverseas/files/resources/db/rp.db output/data/rp_official.db 2>/dev/null || echo "rp.db 不存在"
-
-            echo "--- 提取 effectchannel 文件 ---"
-            for f in $(adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" | tr -d '\r'); do
-              fname=$(basename "$f")
-              echo "提取: $fname"
-              adb pull "$f" "output/data/${fname}" 2>/dev/null || true
-            done
-
-            echo "--- 提取设备信息 ---"
-            adb shell "cat /data/data/com.lemon.lvoverseas/shared_prefs/tt_device_info.xml" > output/logs/device_info.xml 2>/dev/null || true
-            adb shell "cat /data/data/com.lemon.lvoverseas/shared_prefs/ep_sp_config.xml" > output/logs/ep_config.xml 2>/dev/null || true
-
-            echo "========== 阶段 9: API 调用日志 =========="
-            adb logcat -d > output/logs/full_logcat.txt 2>/dev/null
-
-            echo "--- ResPool API 调用 ---"
-            grep -i "respool" output/logs/full_logcat.txt | tail -50 | tee output/logs/respool_calls.txt
-
-            echo ""
-            echo "--- EffectPlatform API 调用 ---"
-            grep -iE "effect.*panel|category/effects|get_panel_info" output/logs/full_logcat.txt | tail -30 | tee output/logs/effect_api.txt
-
-            echo ""
-            echo "--- Shark 检查 ---"
-            grep -i "shark" output/logs/full_logcat.txt | tee output/logs/shark_check.txt
-
-            echo ""
-            echo "--- 网络错误 ---"
-            grep -iE "network.*fail|body is empty|fetch.*failed" output/logs/full_logcat.txt | tail -20 | tee output/logs/network_errors.txt
-
-            echo "========== 完成 =========="
-            echo "截图数量: $(ls output/screenshots/ | wc -l)"
-            echo "日志文件: $(ls output/logs/ | wc -l)"
-            echo "数据文件: $(ls output/data/ | wc -l)"
+          script: bash emu_script.sh
 
       - name: 上传侦察结果
         if: always()
