@@ -1,0 +1,90 @@
+name: 模拟器提取面板数据 (测试)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+          ls -la official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 启动模拟器并测试
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          disable-animations: true
+          script: |
+            echo "=== 模拟器已启动 ==="
+            adb devices
+
+            echo ""
+            echo "=== 安装正版 CapCut ==="
+            # x86_64 模拟器有 ARM 翻译层，可以安装 ARM APK
+            adb install -t official.apk 2>&1 || echo "安装失败（可能 APK 太大或不兼容）"
+
+            echo ""
+            echo "=== 检查安装结果 ==="
+            adb shell pm list packages | grep lemon
+
+            echo ""
+            echo "=== 尝试启动 ==="
+            adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity 2>&1 || echo "启动失败"
+
+            echo ""
+            echo "=== 等待 30 秒让 App 初始化 ==="
+            sleep 30
+
+            echo ""
+            echo "=== 检查进程 ==="
+            adb shell pidof com.lemon.lvoverseas || echo "App 未运行"
+
+            echo ""
+            echo "=== 检查 Logcat 中的错误 ==="
+            adb logcat -d | grep -iE "crash|fatal|shark|error.*lemon" | tail -20
+
+            echo ""
+            echo "=== 检查数据目录 ==="
+            adb shell "run-as com.lemon.lvoverseas ls files/effect/ 2>/dev/null || echo 'run-as 不可用（正版非 debuggable），尝试 root...'"
+
+            echo ""
+            echo "=== 模拟器有 root ==="
+            adb shell "su -c 'ls /data/data/com.lemon.lvoverseas/files/effect/' 2>/dev/null || echo 'root 也不可用'"
+            adb root 2>/dev/null
+            adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/ 2>/dev/null || echo 'adb root 后仍不可用'"
+
+      - name: 上传测试日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-test-log
+          path: |
+            *.log
+          retention-days: 7
