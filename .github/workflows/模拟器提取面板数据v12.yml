@@ -1,0 +1,665 @@
+name: 模拟器提取面板数据 v12 (Desktop弹窗修复+面板遍历)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+          ls -la official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 确认测试视频
+        run: ls -la lv_0_20260226171438.mp4
+
+      - name: 准备状态机导航脚本
+        run: |
+          cat > navigator.py << 'NAVIGATOR_EOF'
+          #!/usr/bin/env python3
+          """CapCut Navigator v12 - Desktop弹窗修复 + 有序面板遍历"""
+
+          import subprocess, time, xml.etree.ElementTree as ET, re, os, sqlite3
+
+          PKG = "com.lemon.lvoverseas"
+          ACTIVITY = f"{PKG}/com.vega.main.MainActivity"
+
+          class Nav:
+              def __init__(self):
+                  self.step = 0
+                  for d in ["output/screenshots", "output/logs", "output/data", "output/ui_dumps"]:
+                      os.makedirs(d, exist_ok=True)
+                  self.logf = open("output/logs/navigator.txt", "w")
+
+                  # >= 3 of these visible = TEXT_PANEL state
+                  self.PANEL_IDENTIFIERS = {"Templates", "Fonts", "Styles", "Effects", "Animations", "Bubble"}
+
+                  # Ordered visit list (skip AI writer & Styles)
+                  self.PANEL_VISIT_ORDER = ["Templates", "Fonts", "Effects", "Animations", "Bubble"]
+                  self.panel_phase = 0
+
+                  self.media_picker_entered = False
+
+              def log(self, msg):
+                  print(msg, flush=True)
+                  self.logf.write(msg + "\n")
+                  self.logf.flush()
+
+              def adb(self, *args):
+                  try:
+                      r = subprocess.run(["adb"] + list(args),
+                                         capture_output=True, text=True, timeout=30)
+                      return r.stdout.strip()
+                  except:
+                      return ""
+
+              def launch_app(self):
+                  self.log("  🚀 启动 CapCut...")
+                  self.adb("shell", "am", "start", "-n", ACTIVITY)
+                  time.sleep(15)
+
+              def snap(self, name):
+                  self.step += 1
+                  tag = f"{self.step:02d}_{name}"
+                  self.adb("shell", "screencap", "-p", "/sdcard/s.png")
+                  subprocess.run(["adb", "pull", "/sdcard/s.png",
+                                  f"output/screenshots/{tag}.png"], capture_output=True)
+                  self.adb("shell", "uiautomator", "dump", "/sdcard/u.xml")
+                  subprocess.run(["adb", "pull", "/sdcard/u.xml",
+                                  f"output/ui_dumps/{tag}.xml"], capture_output=True)
+
+              def tap(self, x, y, desc=""):
+                  self.log(f"  >>> TAP [{x},{y}] {desc}")
+                  self.adb("shell", "input", "tap", str(x), str(y))
+
+              def get_ui(self):
+                  self.adb("shell", "uiautomator", "dump", "/sdcard/nav.xml")
+                  subprocess.run(["adb", "pull", "/sdcard/nav.xml", "/tmp/nav.xml"],
+                                 capture_output=True)
+                  elems = []
+                  try:
+                      for n in ET.parse("/tmp/nav.xml").iter('node'):
+                          t = n.get('text', '')
+                          d = n.get('content-desc', '')
+                          b = n.get('bounds', '')
+                          c = n.get('clickable', 'false') == 'true'
+                          m = re.findall(r'\d+', b)
+                          if len(m) == 4:
+                              elems.append({
+                                  'text': t, 'desc': d,
+                                  'x': (int(m[0]) + int(m[2])) // 2,
+                                  'y': (int(m[1]) + int(m[3])) // 2,
+                                  'clickable': c
+                              })
+                  except:
+                      pass
+                  return elems
+
+              def all_labels(self, elems):
+                  s = set()
+                  for e in elems:
+                      if e['text']:
+                          s.add(e['text'])
+                      if e['desc']:
+                          s.add(e['desc'])
+                  return s
+
+              def has(self, labels, *keywords):
+                  for kw in keywords:
+                      for lb in labels:
+                          if kw.lower() in lb.lower():
+                              return True
+                  return False
+
+              def has_exact(self, labels, *keywords):
+                  for kw in keywords:
+                      if kw in labels:
+                          return True
+                  return False
+
+              def find_tap(self, elems, name, exact=True, click_only=False):
+                  for e in elems:
+                      if click_only and not e['clickable']:
+                          continue
+                      t, d = e['text'], e['desc']
+                      if exact:
+                          if t == name or d == name:
+                              self.tap(e['x'], e['y'], f"'{name}'")
+                              return True
+                      else:
+                          if name.lower() in t.lower() or name.lower() in d.lower():
+                              self.tap(e['x'], e['y'], f"~'{name}'")
+                              return True
+                  return False
+
+              def check_data(self):
+                  """Check effectchannel files and rp.db status"""
+                  r = self.adb("shell",
+                      "ls -la /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null")
+                  self.log(f"  📦 effectchannel: {r or '无'}")
+                  r2 = self.adb("shell",
+                      "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null")
+                  self.log(f"  📦 rp.db: {r2 or '无'}")
+
+              def wait_loading(self, seconds, panel_name):
+                  """Wait for panel data, checking for popups every 20s"""
+                  self.log(f"  ⏳ {panel_name} 数据加载中，等待 {seconds} 秒...")
+                  waited = 0
+                  while waited < seconds:
+                      chunk = min(20, seconds - waited)
+                      time.sleep(chunk)
+                      waited += chunk
+
+                      # Check for popups
+                      elems = self.get_ui()
+                      lb = self.all_labels(elems)
+
+                      if self.has(lb, "Edit on CapCut Desktop"):
+                          self.log(f"  🔔 [{waited}s] Desktop弹窗出现，关闭...")
+                          self.tap(853, 709, "关闭❌Desktop弹窗")
+                          time.sleep(5)
+                      elif self.has_exact(lb, "Sign in & Claim offer"):
+                          self.log(f"  🔔 [{waited}s] 登录弹窗出现，关闭...")
+                          self.tap(1025, 1382, "关闭❌登录弹窗")
+                          time.sleep(5)
+                      elif self.has(lb, "FREE Pro"):
+                          self.log(f"  🔔 [{waited}s] Pro弹窗出现，关闭...")
+                          self.tap(1025, 1382, "关闭❌Pro弹窗")
+                          time.sleep(5)
+
+                      # Check data progress every 40s
+                      if waited % 40 == 0:
+                          self.check_data()
+
+                  self.log(f"  ✅ {panel_name} 等待 {seconds} 秒完成")
+
+              # ==========================================
+              #  State identification
+              # ==========================================
+              def identify(self, elems):
+                  lb = self.all_labels(elems)
+
+                  # --- System-level (highest priority) ---
+                  if self.has(lb, "Pixel is starting"):
+                      return "SYSTEM_BOOT"
+
+                  if self.has_exact(lb, "Wait") and self.has(lb, "isn't responding"):
+                      return "ANR"
+
+                  home_apps = {"Gmail", "Chrome", "Phone", "Messages", "Photos", "YouTube"}
+                  if len(lb & home_apps) >= 3:
+                      return "PHONE_HOME"
+
+                  if self.has_exact(lb, "Wallpaper & style") or self.has_exact(lb, "Widgets"):
+                      return "LAUNCHER_MENU"
+
+                  if self.has_exact(lb, "While using the app"):
+                      return "PERMISSION"
+                  if self.has_exact(lb, "Allow") and \
+                     self.has(lb, "access", "allow", "permission", "want to"):
+                      return "PERMISSION"
+
+                  # --- Popups (before normal CapCut navigation) ---
+                  if self.has(lb, "Edit on CapCut Desktop"):
+                      return "DESKTOP_POPUP"
+
+                  # --- CapCut app states ---
+                  if self.has_exact(lb, "Agree and continue"):
+                      return "TOS"
+
+                  if self.has(lb, "What type of content"):
+                      return "ONBOARDING"
+
+                  if self.has_exact(lb, "Sign in & Claim offer"):
+                      return "SIGNIN_POPUP"
+
+                  if self.has(lb, "FREE Pro"):
+                      return "PRO_POPUP"
+
+                  # Media picker
+                  if self.has_exact(lb, "Albums") or \
+                     (self.has_exact(lb, "Videos") and self.has_exact(lb, "Photos")
+                      and self.has(lb, "00:")):
+                      return "MEDIA_PICKER"
+
+                  # Media selected (Add button shows count)
+                  if any("Add (" in t for t in lb):
+                      return "MEDIA_SELECTED"
+
+                  # Text sub-menu
+                  if self.has_exact(lb, "Add text"):
+                      return "TEXT_MENU"
+
+                  # Text panel (panel tabs visible)
+                  panel_hits = lb & self.PANEL_IDENTIFIERS
+                  if len(panel_hits) >= 3:
+                      return "TEXT_PANEL"
+
+                  # Editor toolbar
+                  editor_tools = {"Text", "Sticker", "Audio", "Filters", "Adjust", "Effects"}
+                  if len(lb & editor_tools) >= 2:
+                      return "EDITOR"
+
+                  # Edit home
+                  if (self.has_exact(lb, "New video") or self.has_exact(lb, "New project")) \
+                     and self.has_exact(lb, "Projects"):
+                      return "EDIT_HOME"
+
+                  # Templates recommendation page
+                  if self.has(lb, "Search CapCut", "AutoCut") and self.has_exact(lb, "Templates"):
+                      return "TEMPLATES_PAGE"
+
+                  # Has bottom nav bar
+                  if self.has_exact(lb, "Edit") and self.has_exact(lb, "Templates") \
+                     and self.has_exact(lb, "AI Lab"):
+                      return "HAS_NAV"
+
+                  # Tutorial overlay
+                  if self.has_exact(lb, "Got it"):
+                      return "TUTORIAL"
+
+                  return "UNKNOWN"
+
+              # ==========================================
+              #  State actions
+              # ==========================================
+              def act(self, state, elems):
+                  lb = self.all_labels(elems)
+
+                  if state == "SYSTEM_BOOT":
+                      self.log("  ⏳ 系统启动中...")
+                      time.sleep(20)
+                      self.launch_app()
+
+                  elif state == "PHONE_HOME":
+                      self.log("  📱 手机主屏幕，启动 CapCut")
+                      self.launch_app()
+
+                  elif state == "LAUNCHER_MENU":
+                      self.log("  📱 桌面菜单，关闭后启动 CapCut")
+                      self.tap(540, 1800, "点空白处关闭菜单")
+                      time.sleep(3)
+                      self.launch_app()
+
+                  elif state == "ANR":
+                      self.log("  ⚠️ ANR！点 Close app → 重启")
+                      self.find_tap(elems, "Close app", click_only=True)
+                      time.sleep(5)
+                      self.launch_app()
+
+                  elif state == "DESKTOP_POPUP":
+                      self.log("  🔔 Desktop推广弹窗，关闭")
+                      self.tap(853, 709, "关闭❌Desktop弹窗")
+                      time.sleep(5)
+
+                  elif state == "TOS":
+                      self.find_tap(elems, "Agree and continue", click_only=True)
+                      time.sleep(8)
+
+                  elif state == "ONBOARDING":
+                      self.find_tap(elems, "Skip", click_only=True)
+                      time.sleep(5)
+
+                  elif state == "SIGNIN_POPUP":
+                      self.tap(1025, 1382, "关闭❌登录弹窗")
+                      time.sleep(5)
+
+                  elif state == "PRO_POPUP":
+                      self.tap(1025, 1382, "关闭❌Pro弹窗")
+                      time.sleep(5)
+
+                  elif state == "PERMISSION":
+                      if not self.find_tap(elems, "While using the app", click_only=True):
+                          if not self.find_tap(elems, "Allow", click_only=True):
+                              self.find_tap(elems, "ALLOW", click_only=True)
+                      time.sleep(5)
+
+                  elif state == "TEMPLATES_PAGE":
+                      self.log("  📄 Templates页 → 切到 Edit")
+                      self.find_tap(elems, "Edit", exact=True, click_only=True)
+                      time.sleep(5)
+
+                  elif state == "EDIT_HOME":
+                      self.log("  🏠 Edit主页 → New video/project")
+                      if not self.find_tap(elems, "New project"):
+                          self.find_tap(elems, "New video")
+                      time.sleep(8)
+
+                  elif state == "HAS_NAV":
+                      self.log("  📍 底部导航 → 切到 Edit")
+                      self.find_tap(elems, "Edit", exact=True, click_only=True)
+                      time.sleep(5)
+
+                  elif state == "MEDIA_PICKER":
+                      if not self.media_picker_entered:
+                          self.log("  ⏳ 等待 10 秒让媒体选择器加载...")
+                          time.sleep(10)
+                          self.media_picker_entered = True
+                      self.log("  🎬 选择视频")
+                      self.tap(226, 426, "勾选视频")
+                      time.sleep(3)
+                      self.tap(944, 1931, "勾选HD")
+                      time.sleep(2)
+                      elems2 = self.get_ui()
+                      if not self.find_tap(elems2, "Add (1)", click_only=True):
+                          if not self.find_tap(elems2, "Add", exact=True, click_only=True):
+                              self.tap(946, 2027, "Add按钮位置")
+                      self.log("  ⏳ 等待 10 秒视频解码...")
+                      time.sleep(10)
+
+                  elif state == "MEDIA_SELECTED":
+                      self.find_tap(elems, "Add", exact=False, click_only=True)
+                      self.log("  ⏳ 等待 10 秒视频解码...")
+                      time.sleep(10)
+
+                  elif state == "EDITOR":
+                      if self.find_tap(elems, "Got it", click_only=True):
+                          time.sleep(3)
+                      else:
+                          self.log("  ✏️ 编辑器 → Text")
+                          self.find_tap(elems, "Text", exact=True)
+                          time.sleep(5)
+
+                  elif state == "TEXT_MENU":
+                      self.log("  📝 Text菜单 → Add text")
+                      self.find_tap(elems, "Add text")
+                      time.sleep(5)
+                      self.adb("shell", "input", "keyevent", "111")
+                      time.sleep(3)
+
+                  elif state == "TEXT_PANEL":
+                      if self.panel_phase >= len(self.PANEL_VISIT_ORDER):
+                          return "DONE"
+
+                      panel = self.PANEL_VISIT_ORDER[self.panel_phase]
+                      self.log(f"\n  {'=' * 50}")
+                      self.log(f"  📋 面板阶段 {self.panel_phase + 1}/{len(self.PANEL_VISIT_ORDER)}: {panel}")
+                      self.log(f"  {'=' * 50}")
+
+                      if panel == "Templates":
+                          # Already selected by default
+                          self.log("  Templates 已默认选中，无需点击")
+                          self.wait_loading(100, "Templates")
+                          self.check_data()
+                          self.panel_phase += 1
+
+                      elif panel == "Bubble":
+                          # Swipe left to reveal Bubble
+                          anim_x, anim_y = 987, 1697  # fallback coordinates
+                          for e in elems:
+                              if e['text'] == 'Animations':
+                                  anim_x, anim_y = e['x'], e['y']
+                                  break
+
+                          self.log(f"  👆 从 Animations [{anim_x},{anim_y}] 向左滑动...")
+                          end_x = max(anim_x - 400, 100)
+                          self.adb("shell", "input", "swipe",
+                                   str(anim_x), str(anim_y),
+                                   str(end_x), str(anim_y), "500")
+                          time.sleep(5)
+
+                          # Re-read UI after swipe
+                          elems2 = self.get_ui()
+                          lb2 = self.all_labels(elems2)
+
+                          # Handle popup if appeared during swipe
+                          if self.has(lb2, "Edit on CapCut Desktop"):
+                              self.tap(853, 709, "关闭❌Desktop弹窗")
+                              time.sleep(5)
+                              elems2 = self.get_ui()
+                              lb2 = self.all_labels(elems2)
+
+                          if "Bubble" in lb2:
+                              self.log("  ✅ Bubble 已展开，点击")
+                              self.find_tap(elems2, "Bubble", exact=True)
+                              self.wait_loading(100, "Bubble")
+                              self.check_data()
+                          else:
+                              self.log("  ⚠️ 滑动后未找到 Bubble，跳过")
+
+                          self.panel_phase += 1
+
+                      else:
+                          # Fonts, Effects, Animations
+                          if self.find_tap(elems, panel, exact=True):
+                              self.wait_loading(100, panel)
+                              self.check_data()
+                          else:
+                              self.log(f"  ⚠️ {panel} 未找到，跳过")
+                          self.panel_phase += 1
+
+                  elif state == "TUTORIAL":
+                      if not self.find_tap(elems, "Got it", click_only=True):
+                          self.find_tap(elems, "OK", click_only=True)
+                      time.sleep(3)
+
+                  elif state == "UNKNOWN":
+                      self.log("  ❓ 未知状态，尝试恢复")
+                      for btn in ["Got it", "OK", "Skip", "Close", "Cancel",
+                                  "Not now", "Later", "Dismiss", "No thanks"]:
+                          if self.find_tap(elems, btn, click_only=True):
+                              time.sleep(3)
+                              return None
+                      pid = self.adb("shell", "pidof", PKG)
+                      if not pid:
+                          self.log("  App 未运行，重启")
+                      else:
+                          self.log("  App 在运行但界面未知，重新拉起")
+                      self.launch_app()
+
+                  return None
+
+              # ==========================================
+              #  Data extraction
+              # ==========================================
+              def extract(self):
+                  self.log("\n========== 最终数据提取 ==========")
+
+                  r = self.adb("shell",
+                      "ls -la /data/data/com.lemon.lvoverseas/files/effect/")
+                  self.log(f"effect目录:\n{r}")
+                  with open("output/logs/final_effect_dir.txt", "w") as f:
+                      f.write(r)
+
+                  r = self.adb("shell",
+                      "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 "
+                      "\\( -name 'effectchannel*' -o -name 'effect_version*' \\) "
+                      "-exec ls -la {} \\;")
+                  self.log(f"channels:\n{r}")
+                  with open("output/logs/final_channels.txt", "w") as f:
+                      f.write(r)
+
+                  r = self.adb("shell",
+                      "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db "
+                      "2>/dev/null")
+                  self.log(f"rp.db: {r}")
+                  with open("output/logs/final_rpdb.txt", "w") as f:
+                      f.write(r)
+
+                  # Pull rp.db
+                  subprocess.run(["adb", "pull",
+                      "/data/data/com.lemon.lvoverseas/files/resources/db/rp.db",
+                      "output/data/rp_official.db"], capture_output=True)
+
+                  # Pull all effectchannel + effect_version files
+                  channels = self.adb("shell",
+                      "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 "
+                      "\\( -name 'effectchannel*' -o -name 'effect_version*' \\)")
+                  for line in channels.split('\n'):
+                      line = line.strip().replace('\r', '')
+                      if line:
+                          fname = os.path.basename(line)
+                          self.log(f"  提取: {fname}")
+                          subprocess.run(["adb", "pull", line,
+                                          f"output/data/{fname}"], capture_output=True)
+
+                  # Logcat
+                  self.log("\n--- 提取 logcat ---")
+                  logcat = self.adb("shell", "logcat", "-d")
+                  with open("output/logs/full_logcat.txt", "w") as f:
+                      f.write(logcat)
+
+                  for tag, pattern in [
+                      ("respool", "respool"),
+                      ("effect_api", "effect.*panel|category/effects|get_panel_info"),
+                      ("shark", "shark"),
+                      ("network_errors", "network.*fail|body is empty|fetch.*failed"),
+                  ]:
+                      lines = [l for l in logcat.split('\n')
+                               if re.search(pattern, l, re.I)]
+                      with open(f"output/logs/{tag}.txt", "w") as f:
+                          f.write('\n'.join(lines[-80:]))
+                      if lines:
+                          self.log(f"  {tag}: {len(lines)} 行")
+
+                  # Analyze rp.db
+                  if os.path.exists("output/data/rp_official.db"):
+                      self.log("\n=== rp.db 分析 ===")
+                      try:
+                          db = sqlite3.connect("output/data/rp_official.db")
+                          c = db.cursor()
+                          for q, name, fn in [
+                              ("SELECT name, version FROM panel_info",
+                               "面板", "rpdb_panels.txt"),
+                              ("SELECT panel, COUNT(*) FROM panel_category GROUP BY panel",
+                               "分类", "rpdb_categories.txt"),
+                              ("SELECT COUNT(*) FROM effect",
+                               "特效数", "rpdb_effects.txt"),
+                          ]:
+                              c.execute(q)
+                              rows = c.fetchall()
+                              self.log(f"  {name}: {rows}")
+                              with open(f"output/logs/{fn}", "w") as f:
+                                  for r in rows:
+                                      f.write(f"{r}\n")
+                          db.close()
+                      except Exception as ex:
+                          self.log(f"  rp.db 分析失败: {ex}")
+
+              # ==========================================
+              #  Main loop
+              # ==========================================
+              def run(self):
+                  self.log("========== 安装与初始化 ==========")
+                  self.adb("install", "-t", "official.apk")
+                  self.adb("root")
+                  time.sleep(5)
+
+                  for p in ["READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE",
+                           "READ_MEDIA_VIDEO", "READ_MEDIA_IMAGES", "READ_MEDIA_AUDIO",
+                           "CAMERA", "RECORD_AUDIO", "POST_NOTIFICATIONS"]:
+                      self.adb("shell", "pm", "grant", PKG,
+                               f"android.permission.{p}")
+
+                  self.adb("push", "lv_0_20260226171438.mp4",
+                           "/sdcard/DCIM/test_video.mp4")
+                  self.adb("shell", "am", "broadcast", "-a",
+                           "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                           "-d", "file:///sdcard/DCIM/test_video.mp4")
+                  time.sleep(5)
+
+                  self.log("========== 启动 App ==========")
+                  self.launch_app()
+
+                  self.log("========== 开始状态机导航 ==========")
+                  prev_state = None
+                  stuck_count = 0
+
+                  for i in range(80):
+                      elems = self.get_ui()
+                      state = self.identify(elems)
+
+                      self.log(f"\n--- 迭代 {i+1}/80 | 状态: {state} "
+                               f"| 面板: {self.panel_phase}/{len(self.PANEL_VISIT_ORDER)} ---")
+                      for e in elems:
+                          if e['text'] or e['desc']:
+                              tag = e['text'] or f"[{e['desc']}]"
+                              self.log(f"  [{e['x']:>4},{e['y']:>4}] "
+                                       f"{'C' if e['clickable'] else ' '} \"{tag}\"")
+
+                      self.snap(state.lower())
+
+                      # Stuck detection
+                      if state == prev_state:
+                          stuck_count += 1
+                          if stuck_count > 3:
+                              self.log(f"  ⚠️ 在 {state} 卡了 {stuck_count} 次")
+                          if stuck_count > 8:
+                              self.log("  🔄 强制重启 App")
+                              self.adb("shell", "am", "force-stop", PKG)
+                              time.sleep(3)
+                              self.launch_app()
+                              stuck_count = 0
+                      else:
+                          stuck_count = 0
+                      prev_state = state
+
+                      result = self.act(state, elems)
+                      if result == "DONE":
+                          self.log("\n🎉 所有面板已遍历完成！")
+                          break
+
+                      time.sleep(2)
+
+                  # Final API wait
+                  self.log("\n========== 等待 API 完成 (120秒) ==========")
+                  time.sleep(120)
+
+                  self.extract()
+
+                  self.log(f"\n========== 完成 ==========")
+                  self.log(f"截图: {len(os.listdir('output/screenshots'))}")
+                  self.log(f"日志: {len(os.listdir('output/logs'))}")
+                  self.log(f"数据: {len(os.listdir('output/data'))}")
+                  self.log(f"面板完成: {self.panel_phase}/{len(self.PANEL_VISIT_ORDER)}")
+
+          if __name__ == "__main__":
+              Nav().run()
+          NAVIGATOR_EOF
+          echo "✅ v12 导航脚本已生成"
+
+      - name: 模拟器状态机导航
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          ram-size: 4096
+          heap-size: 1024
+          disk-size: 8192M
+          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -memory 4096
+          disable-animations: true
+          emulator-boot-timeout: 600
+          script: python3 navigator.py
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-recon-v12
+          path: output/
+          retention-days: 7
