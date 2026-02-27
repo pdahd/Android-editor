@@ -1,4 +1,4 @@
-name: 模拟器提取面板数据 v9 (修复系统崩溃)
+name: 模拟器提取面板数据 v10 (状态机导航)
 
 on:
   workflow_dispatch:
@@ -35,345 +35,392 @@ jobs:
       - name: 确认测试视频
         run: ls -la lv_0_20260226171438.mp4
 
-      - name: 准备辅助脚本
+      - name: 准备状态机导航脚本
         run: |
-          cat > tap_clickable.py << 'PYEOF'
-          import xml.etree.ElementTree as ET
-          import re, sys
-          xml_path, search_text = sys.argv[1], sys.argv[2]
-          try: tree = ET.parse(xml_path)
-          except: sys.exit(1)
-          for node in tree.iter('node'):
-              text = node.get('text') or ''
-              desc = node.get('content-desc') or ''
-              if (text == search_text or desc == search_text) and node.get('clickable') == 'true':
-                  m = re.findall(r'\d+', node.get('bounds', ''))
-                  if len(m) == 4:
-                      print(f"{(int(m[0])+int(m[2]))//2} {(int(m[1])+int(m[3]))//2}")
-                      sys.exit(0)
-          sys.exit(1)
-          PYEOF
+          cat > navigator.py << 'NAVIGATOR_EOF'
+          #!/usr/bin/env python3
+          """CapCut 状态机导航器 - 看路走路，不盲走"""
 
-          cat > tap_any.py << 'PYEOF'
-          import xml.etree.ElementTree as ET
-          import re, sys
-          xml_path, search_text = sys.argv[1], sys.argv[2]
-          try: tree = ET.parse(xml_path)
-          except: sys.exit(1)
-          for node in tree.iter('node'):
-              text = node.get('text') or ''
-              desc = node.get('content-desc') or ''
-              if text == search_text or desc == search_text:
-                  m = re.findall(r'\d+', node.get('bounds', ''))
-                  if len(m) == 4:
-                      print(f"{(int(m[0])+int(m[2]))//2} {(int(m[1])+int(m[3]))//2}")
-                      sys.exit(0)
-          sys.exit(1)
-          PYEOF
+          import subprocess, time, xml.etree.ElementTree as ET, re, os, sys, sqlite3
 
-          cat > tap_contains_any.py << 'PYEOF'
-          import xml.etree.ElementTree as ET
-          import re, sys
-          xml_path, search_text = sys.argv[1], sys.argv[2].lower()
-          try: tree = ET.parse(xml_path)
-          except: sys.exit(1)
-          for node in tree.iter('node'):
-              text = (node.get('text') or '').lower()
-              desc = (node.get('content-desc') or '').lower()
-              if search_text in text or search_text in desc:
-                  m = re.findall(r'\d+', node.get('bounds', ''))
-                  if len(m) == 4:
-                      print(f"{(int(m[0])+int(m[2]))//2} {(int(m[1])+int(m[3]))//2}")
-                      sys.exit(0)
-          sys.exit(1)
-          PYEOF
+          class Nav:
+              def __init__(self):
+                  self.step = 0
+                  for d in ["output/screenshots","output/logs","output/data","output/ui_dumps"]:
+                      os.makedirs(d, exist_ok=True)
+                  self.logf = open("output/logs/navigator.txt","w")
+                  self.panels_visited = set()
+                  self.TARGET_PANELS = {"Templates","Fonts","Effects","Animations","Bubble","Presets","Styles"}
 
-          # 专门找关闭按钮（X 图标，通常是 ImageView/ImageButton 且没有文字）
-          cat > find_close_btn.py << 'PYEOF'
-          import xml.etree.ElementTree as ET
-          import re, sys
-          try:
-              tree = ET.parse(sys.argv[1])
-              for node in tree.iter('node'):
-                  desc = (node.get('content-desc') or '').lower()
-                  cls = node.get('class', '')
-                  clickable = node.get('clickable', 'false')
-                  if clickable == 'true' and ('close' in desc or 'dismiss' in desc or '关闭' in desc):
-                      m = re.findall(r'\d+', node.get('bounds', ''))
-                      if len(m) == 4:
-                          print(f"{(int(m[0])+int(m[2]))//2} {(int(m[1])+int(m[3]))//2}")
-                          sys.exit(0)
-          except: pass
-          sys.exit(1)
-          PYEOF
+              def log(self, msg):
+                  print(msg, flush=True)
+                  self.logf.write(msg+"\n"); self.logf.flush()
 
-          cat > list_ui_helper.py << 'PYEOF'
-          import xml.etree.ElementTree as ET
-          import re, sys
-          try:
-              tree = ET.parse(sys.argv[1])
-              for node in tree.iter('node'):
-                  text = node.get('text', '')
-                  desc = node.get('content-desc', '')
-                  bounds = node.get('bounds', '')
-                  clickable = node.get('clickable', 'false')
-                  if text or desc:
-                      m = re.findall(r'\d+', bounds)
-                      cx = cy = 0
-                      if len(m) == 4:
-                          cx = (int(m[0])+int(m[2]))//2
-                          cy = (int(m[1])+int(m[3]))//2
-                      label = text if text else f"[desc:{desc}]"
-                      print(f"  [{cx:>4},{cy:>4}] click={clickable:<5} \"{label}\"")
-          except Exception as e:
-              print(f"Error: {e}")
-          PYEOF
+              def adb(self, *args):
+                  try:
+                      r = subprocess.run(["adb"]+list(args), capture_output=True, text=True, timeout=30)
+                      return r.stdout.strip()
+                  except: return ""
 
-          cat > emu_script.sh << 'BASHEOF'
-          #!/bin/bash
-          set -x
+              def snap(self, name):
+                  self.step += 1
+                  tag = f"{self.step:02d}_{name}"
+                  self.adb("shell","screencap","-p","/sdcard/s.png")
+                  subprocess.run(["adb","pull","/sdcard/s.png",f"output/screenshots/{tag}.png"],
+                                capture_output=True)
+                  self.adb("shell","uiautomator","dump","/sdcard/u.xml")
+                  subprocess.run(["adb","pull","/sdcard/u.xml",f"output/ui_dumps/{tag}.xml"],
+                                capture_output=True)
 
-          mkdir -p output/screenshots output/logs output/data output/ui_dumps
+              def tap(self, x, y, desc=""):
+                  self.log(f"  >>> TAP [{x},{y}] {desc}")
+                  self.adb("shell","input","tap",str(x),str(y))
 
-          dump_ui() {
-            adb shell uiautomator dump /sdcard/ui_tap.xml 2>/dev/null
-            adb pull /sdcard/ui_tap.xml /tmp/ui_tap.xml 2>/dev/null
-          }
+              def get_ui(self):
+                  self.adb("shell","uiautomator","dump","/sdcard/nav.xml")
+                  subprocess.run(["adb","pull","/sdcard/nav.xml","/tmp/nav.xml"],capture_output=True)
+                  elems = []
+                  try:
+                      for n in ET.parse("/tmp/nav.xml").iter('node'):
+                          t,d,b = n.get('text',''), n.get('content-desc',''), n.get('bounds','')
+                          c = n.get('clickable','false')=='true'
+                          m = re.findall(r'\d+',b)
+                          if len(m)==4:
+                              elems.append({'text':t,'desc':d,
+                                           'x':(int(m[0])+int(m[2]))//2,
+                                           'y':(int(m[1])+int(m[3]))//2,
+                                           'clickable':c})
+                  except: pass
+                  return elems
 
-          snap() {
-            adb shell screencap -p /sdcard/screen.png 2>/dev/null
-            adb pull /sdcard/screen.png "output/screenshots/${1}.png" 2>/dev/null || true
-            adb shell uiautomator dump /sdcard/ui.xml 2>/dev/null
-            adb pull /sdcard/ui.xml "output/ui_dumps/${1}.xml" 2>/dev/null || true
-          }
+              def texts(self, elems):
+                  s = set()
+                  for e in elems:
+                      if e['text']: s.add(e['text'])
+                      if e['desc']: s.add(e['desc'])
+                  return s
 
-          tap_btn() {
-            dump_ui
-            local coords
-            coords=$(python3 tap_clickable.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
-            echo ">>> BTN '$1' at $coords"
-            adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
-          }
+              def find_tap(self, elems, name, exact=True, click_only=False):
+                  for e in elems:
+                      if click_only and not e['clickable']: continue
+                      t, d = e['text'], e['desc']
+                      if exact:
+                          if t==name or d==name:
+                              self.tap(e['x'],e['y'],f"'{name}'")
+                              return True
+                      else:
+                          if name.lower() in t.lower() or name.lower() in d.lower():
+                              self.tap(e['x'],e['y'],f"~'{name}'")
+                              return True
+                  return False
 
-          tap_any() {
-            dump_ui
-            local coords
-            coords=$(python3 tap_any.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
-            echo ">>> ANY '$1' at $coords"
-            adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
-          }
+              def identify(self, elems):
+                  tx = self.texts(elems)
+                  # 按优先级判断
+                  if any("Pixel is starting" in t for t in tx): return "SYSTEM_BOOT"
+                  if "Agree and continue" in tx: return "TOS"
+                  if any("What type of content" in t for t in tx): return "ONBOARDING"
+                  if "Wait" in tx and "Close app" in tx: return "ANR"
+                  if "Sign in & Claim offer" in tx: return "SIGNIN_POPUP"
+                  if any("FREE Pro" in t for t in tx): return "PRO_POPUP"
+                  if "Allow" in tx and any("access" in t.lower() or "permission" in t.lower() or "allow" in t.lower() for t in tx):
+                      # Check if it's a system permission dialog
+                      if any("While using" in t for t in tx): return "PERMISSION"
+                      if any("ALLOW" in t or "DENY" in t or "Don" in t for t in tx): return "PERMISSION"
+                  if "Albums" in tx: return "MEDIA_PICKER"
+                  if "Videos" in tx and "Photos" in tx: return "MEDIA_PICKER"
+                  if any("Add (" in t for t in tx): return "MEDIA_SELECTED"
+                  if "Add text" in tx: return "TEXT_MENU"
+                  # 检查是否在字幕面板
+                  panel_hits = tx & self.TARGET_PANELS
+                  if len(panel_hits) >= 3: return "TEXT_PANEL"
+                  # 编辑器（有Text等工具按钮）
+                  editor_tools = {"Text","Sticker","Audio","Filters","Adjust"}
+                  if len(tx & editor_tools) >= 2: return "EDITOR"
+                  # 看是否有编辑器的 Text 按钮（可能只有少量工具可见）
+                  if "Text" in tx and ("Sticker" in tx or "Audio" in tx): return "EDITOR"
+                  # Edit 主页
+                  if ("New video" in tx or "New project" in tx) and "Projects" in tx: return "EDIT_HOME"
+                  # Templates 推荐页
+                  if ("Search CapCut" in tx or "AutoCut" in tx) and "Templates" in tx: return "TEMPLATES_PAGE"
+                  # 有底部导航栏
+                  if "Edit" in tx and "Templates" in tx and "AI Lab" in tx: return "HAS_NAV"
+                  # Got it / OK 引导
+                  if "Got it" in tx: return "TUTORIAL"
+                  if "OK" in tx and len(tx) < 5: return "TUTORIAL"
+                  return "UNKNOWN"
 
-          tap_fuzzy() {
-            dump_ui
-            local coords
-            coords=$(python3 tap_contains_any.py /tmp/ui_tap.xml "$1" 2>/dev/null) || return 1
-            echo ">>> FUZZY '$1' at $coords"
-            adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
-          }
+              def act(self, state, elems):
+                  tx = self.texts(elems)
 
-          tap_close() {
-            dump_ui
-            local coords
-            coords=$(python3 find_close_btn.py /tmp/ui_tap.xml 2>/dev/null) || return 1
-            echo ">>> CLOSE at $coords"
-            adb shell input tap $(echo "$coords" | cut -d' ' -f1) $(echo "$coords" | cut -d' ' -f2)
-          }
+                  if state == "SYSTEM_BOOT":
+                      self.log("  等待系统启动...")
+                      time.sleep(15)
+                      self.adb("shell","am","start","-n",
+                              "com.lemon.lvoverseas/com.vega.main.MainActivity")
+                      time.sleep(10)
 
-          list_ui() {
-            adb shell uiautomator dump /sdcard/ui_list.xml 2>/dev/null
-            adb pull /sdcard/ui_list.xml /tmp/ui_list.xml 2>/dev/null || return 1
-            python3 list_ui_helper.py /tmp/ui_list.xml 2>/dev/null
-          }
+                  elif state == "TOS":
+                      self.find_tap(elems,"Agree and continue",click_only=True)
+                      time.sleep(8)
 
-          # 确保 App 在前台（如果意外退出就重新打开）
-          ensure_app() {
-            local pid
-            pid=$(adb shell pidof com.lemon.lvoverseas 2>/dev/null)
-            if [ -z "$pid" ]; then
-              echo "!!! App 不在运行，重新启动 !!!"
-              adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity
-              sleep 10
-            fi
-          }
+                  elif state == "ONBOARDING":
+                      self.find_tap(elems,"Skip",click_only=True)
+                      time.sleep(5)
 
-          echo "========== 阶段 1: 安装与初始化 =========="
-          adb install -t official.apk
-          adb root
-          sleep 5
+                  elif state == "ANR":
+                      self.find_tap(elems,"Wait",click_only=True)
+                      time.sleep(5)
 
-          for perm in READ_EXTERNAL_STORAGE WRITE_EXTERNAL_STORAGE READ_MEDIA_VIDEO \
-                      READ_MEDIA_IMAGES READ_MEDIA_AUDIO CAMERA RECORD_AUDIO \
-                      POST_NOTIFICATIONS; do
-            adb shell pm grant com.lemon.lvoverseas "android.permission.${perm}" 2>/dev/null || true
-          done
+                  elif state == "SIGNIN_POPUP":
+                      self.tap(1025,1382,"关闭❌登录弹窗")
+                      time.sleep(5)
 
-          adb push lv_0_20260226171438.mp4 /sdcard/DCIM/test_video.mp4
-          adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
-            -d file:///sdcard/DCIM/test_video.mp4 2>/dev/null
-          sleep 5
+                  elif state == "PRO_POPUP":
+                      self.tap(1025,1382,"关闭❌Pro弹窗")
+                      time.sleep(5)
 
-          # ★ 不再禁用 Launcher（v5-v8 的 ANR 已不出现）
+                  elif state == "PERMISSION":
+                      if not self.find_tap(elems,"While using the app",click_only=True):
+                          if not self.find_tap(elems,"Allow",click_only=True):
+                              if not self.find_tap(elems,"ALLOW",click_only=True):
+                                  self.find_tap(elems,"Don't allow",click_only=True)
+                      time.sleep(5)
 
-          echo "========== A: 启动 =========="
-          adb shell am start -n com.lemon.lvoverseas/com.vega.main.MainActivity
-          sleep 25
-          snap "01_launch"
-          list_ui | tee output/logs/01_ui.txt
+                  elif state == "TEMPLATES_PAGE":
+                      self.find_tap(elems,"Edit",exact=True,click_only=True)
+                      time.sleep(5)
 
-          echo "========== B: 同意条款 =========="
-          tap_btn "Agree and continue"
-          sleep 8
-          snap "02_agree"
-          list_ui | tee output/logs/02_ui.txt
+                  elif state == "EDIT_HOME":
+                      if not self.find_tap(elems,"New project"):
+                          self.find_tap(elems,"New video")
+                      time.sleep(8)
 
-          echo "========== C: 跳过引导 =========="
-          tap_btn "Skip"
-          sleep 5
-          snap "03_skip1"
-          list_ui | tee output/logs/03_ui.txt
+                  elif state == "HAS_NAV":
+                      self.find_tap(elems,"Edit",exact=True,click_only=True)
+                      time.sleep(5)
 
-          # 可能有第二页引导
-          tap_btn "Skip" || true
-          sleep 5
-          snap "04_skip2"
-          list_ui | tee output/logs/04_ui.txt
+                  elif state == "MEDIA_PICKER":
+                      self.log("  选择视频流程...")
+                      self.tap(226,426,"勾选视频")
+                      time.sleep(3)
+                      self.tap(944,1931,"勾选HD")
+                      time.sleep(2)
+                      # 重新读取UI看Add按钮
+                      elems2 = self.get_ui()
+                      if not self.find_tap(elems2,"Add (1)",click_only=True):
+                          if not self.find_tap(elems2,"Add",exact=True,click_only=True):
+                              self.tap(946,2027,"Add按钮位置")
+                      time.sleep(15)
 
-          echo "========== D: 等待 Pro 弹窗自动消失 =========="
-          # 不按返回键！等它自己消失或尝试点关闭按钮
-          sleep 10
-          snap "05_wait_pro"
-          list_ui | tee output/logs/05_ui.txt
+                  elif state == "MEDIA_SELECTED":
+                      self.find_tap(elems,"Add",exact=False,click_only=True)
+                      time.sleep(15)
 
-          # 尝试找到并点击关闭按钮（X）
-          tap_close || true
-          sleep 5
-          snap "06_after_close"
-          list_ui | tee output/logs/06_ui.txt
+                  elif state == "EDITOR":
+                      # 先处理可能的引导
+                      if self.find_tap(elems,"Got it",click_only=True):
+                          time.sleep(3)
+                      elif self.find_tap(elems,"Text",exact=True):
+                          time.sleep(5)
 
-          echo "========== E: 切换到 Edit 标签 =========="
-          ensure_app
-          tap_btn "Edit"
-          sleep 5
-          snap "07_edit_tab"
-          list_ui | tee output/logs/07_ui.txt
+                  elif state == "TEXT_MENU":
+                      self.find_tap(elems,"Add text")
+                      time.sleep(5)
+                      self.adb("shell","input","keyevent","111")  # Escape关键盘
+                      time.sleep(3)
 
-          echo "========== F: 点击 New video =========="
-          ensure_app
-          tap_any "New video"
-          sleep 8
-          snap "08_new_video"
-          list_ui | tee output/logs/08_ui.txt
+                  elif state == "TEXT_PANEL":
+                      remaining = self.TARGET_PANELS - self.panels_visited
+                      if not remaining:
+                          return "DONE"
+                      # 找一个存在于当前UI中的面板
+                      for p in list(remaining):
+                          if p in self.texts(elems):
+                              self.find_tap(elems, p, exact=True)
+                              self.panels_visited.add(p)
+                              time.sleep(10)
+                              # 检查 effectchannel
+                              r = self.adb("shell","ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null")
+                              self.log(f"  effectchannel: {r or '无'}")
+                              break
+                      else:
+                          # 没找到未访问的面板，标记全部完成
+                          for p in remaining:
+                              self.panels_visited.add(p)
 
-          # 处理权限弹窗
-          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
-          sleep 5
-          tap_btn "Allow" || tap_btn "While using the app" || tap_btn "ALLOW" || true
-          sleep 5
-          snap "09_after_perm"
-          list_ui | tee output/logs/09_ui.txt
+                  elif state == "TUTORIAL":
+                      if not self.find_tap(elems,"Got it",click_only=True):
+                          if not self.find_tap(elems,"OK",click_only=True):
+                              self.find_tap(elems,"Skip",click_only=True)
+                      time.sleep(3)
 
-          echo "========== G: 选择视频 =========="
-          # ❶ 勾选视频右上角小圆圈
-          echo ">>> 勾选视频 at 226,426"
-          adb shell input tap 226 426
-          sleep 5
-          snap "10_video_checked"
-          list_ui | tee output/logs/10_ui.txt
+                  elif state == "UNKNOWN":
+                      self.log("  未知状态，尝试恢复...")
+                      # 尝试常见按钮
+                      for btn in ["Got it","OK","Skip","Allow","Close","Cancel",
+                                  "Not now","Later","Don't allow","Dismiss"]:
+                          if self.find_tap(elems,btn,click_only=True):
+                              time.sleep(3)
+                              return None
+                      # 检查App是否在运行
+                      pid = self.adb("shell","pidof","com.lemon.lvoverseas")
+                      if not pid:
+                          self.log("  App未运行，重启...")
+                          self.adb("shell","am","start","-n",
+                                  "com.lemon.lvoverseas/com.vega.main.MainActivity")
+                          time.sleep(15)
+                      else:
+                          time.sleep(5)
 
-          # ❷ 勾选 HD
-          echo ">>> 勾选 HD at 944,1931"
-          adb shell input tap 944 1931
-          sleep 3
-          snap "11_hd_checked"
-          list_ui | tee output/logs/11_ui.txt
+                  return None
 
-          # ❸ 点击 Add
-          echo ">>> 点击 Add"
-          tap_btn "Add" || tap_any "Add" || tap_any "Add (1)" || tap_fuzzy "add" || true
-          sleep 15
-          snap "12_editor_loading"
-          list_ui | tee output/logs/12_ui.txt
+              def extract(self):
+                  self.log("\n========== 最终数据提取 ==========")
+                  r = self.adb("shell","ls -la /data/data/com.lemon.lvoverseas/files/effect/")
+                  self.log(f"effect目录:\n{r}")
+                  with open("output/logs/final_effect_dir.txt","w") as f: f.write(r)
 
-          echo "========== H: 编辑器 =========="
-          ensure_app
-          # 处理引导提示（每次间隔足够）
-          tap_btn "Got it" || tap_btn "OK" || tap_btn "Skip" || true
-          sleep 5
-          tap_btn "Got it" || tap_btn "OK" || true
-          sleep 5
-          tap_btn "Got it" || tap_btn "OK" || true
-          sleep 3
-          snap "13_editor"
-          list_ui | tee output/logs/13_ui.txt
+                  r = self.adb("shell","find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 "
+                              "\\( -name 'effectchannel*' -o -name 'effect_version*' \\) -exec ls -la {} \\;")
+                  self.log(f"channels:\n{r}")
+                  with open("output/logs/final_channels.txt","w") as f: f.write(r)
 
-          echo "========== I: 点击 Text =========="
-          tap_any "Text" || tap_btn "Text" || tap_fuzzy "text" || true
-          sleep 5
-          snap "14_text_menu"
-          list_ui | tee output/logs/14_ui.txt
+                  r = self.adb("shell","ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null")
+                  self.log(f"rp.db: {r}")
+                  with open("output/logs/final_rpdb.txt","w") as f: f.write(r)
 
-          echo "========== J: 点击 Add text =========="
-          tap_any "Add text" || tap_btn "Add text" || tap_fuzzy "add text" || true
-          sleep 5
-          # 关闭键盘
-          adb shell input keyevent 111
-          sleep 3
-          # 处理引导
-          tap_btn "Got it" || tap_btn "OK" || true
-          sleep 3
-          snap "15_text_added"
-          list_ui | tee output/logs/15_ui.txt
+                  # 提取 rp.db
+                  subprocess.run(["adb","pull",
+                                 "/data/data/com.lemon.lvoverseas/files/resources/db/rp.db",
+                                 "output/data/rp_official.db"], capture_output=True)
 
-          echo "========== K: 遍历字幕面板 =========="
-          for panel in Templates Fonts Effects Animations Bubble Presets Styles; do
-            echo "===== 面板: $panel ====="
-            ensure_app
-            tap_any "$panel" || tap_btn "$panel" || tap_fuzzy "$panel" || true
-            sleep 12
-            snap "16_${panel}"
-            list_ui | tee "output/logs/16_${panel}.txt"
-            echo "--- effectchannel ---"
-            adb shell "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null" || echo "无"
-          done
+                  # 提取 effectchannel
+                  channels = self.adb("shell","find /data/data/com.lemon.lvoverseas/files/effect/ "
+                                     "-maxdepth 1 \\( -name 'effectchannel*' -o -name 'effect_version*' \\)")
+                  for f in channels.split('\n'):
+                      f = f.strip().replace('\r','')
+                      if f:
+                          fname = os.path.basename(f)
+                          self.log(f"  提取: {fname}")
+                          subprocess.run(["adb","pull",f,f"output/data/{fname}"],capture_output=True)
 
-          echo "========== L: 等待 API 120秒 =========="
-          sleep 120
+                  # 日志
+                  self.log("--- 提取 logcat ---")
+                  logcat = self.adb("shell","logcat","-d")
+                  with open("output/logs/full_logcat.txt","w") as f: f.write(logcat)
 
-          echo "========== 最终提取 =========="
-          adb shell "ls -la /data/data/com.lemon.lvoverseas/files/effect/" 2>/dev/null | tee output/logs/final_effect_dir.txt
-          adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 \( -name 'effectchannel*' -o -name 'effect_version*' \) -exec ls -la {} \;" 2>/dev/null | tee output/logs/final_channels.txt
-          adb shell "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null" | tee output/logs/final_rpdb.txt
+                  for tag, pattern in [("respool","respool"),("effect_api","effect.*panel|category/effects|get_panel_info"),
+                                       ("shark","shark"),("network_errors","network.*fail|body is empty|fetch.*failed")]:
+                      import re as re2
+                      lines = [l for l in logcat.split('\n') if re2.search(pattern, l, re2.I)]
+                      with open(f"output/logs/{tag}.txt","w") as f: f.write('\n'.join(lines[-80:]))
+                      if lines: self.log(f"  {tag}: {len(lines)} 行")
 
-          adb pull /data/data/com.lemon.lvoverseas/files/resources/db/rp.db output/data/rp_official.db 2>/dev/null || echo "rp.db 不存在"
+                  # 分析 rp.db
+                  if os.path.exists("output/data/rp_official.db"):
+                      self.log("\n=== rp.db 分析 ===")
+                      try:
+                          db = sqlite3.connect("output/data/rp_official.db")
+                          c = db.cursor()
+                          c.execute("SELECT name, version FROM panel_info")
+                          rows = c.fetchall()
+                          self.log(f"面板: {rows}")
+                          with open("output/logs/rpdb_panels.txt","w") as f:
+                              for r in rows: f.write(f"{r[0]}\t{r[1]}\n")
 
-          for f in $(adb shell "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 \( -name 'effectchannel*' -o -name 'effect_version*' \) 2>/dev/null" | tr -d '\r'); do
-            fname=$(basename "$f")
-            adb pull "$f" "output/data/${fname}" 2>/dev/null || true
-          done
+                          c.execute("SELECT panel, COUNT(*) FROM panel_category GROUP BY panel")
+                          rows = c.fetchall()
+                          self.log(f"分类: {rows}")
+                          with open("output/logs/rpdb_categories.txt","w") as f:
+                              for r in rows: f.write(f"{r[0]}\t{r[1]}\n")
 
-          adb logcat -d > output/logs/full_logcat.txt 2>/dev/null
-          grep -i "respool" output/logs/full_logcat.txt 2>/dev/null | tail -80 | tee output/logs/respool_calls.txt || true
-          grep -iE "effect.*panel|category/effects|get_panel_info" output/logs/full_logcat.txt 2>/dev/null | tail -50 | tee output/logs/effect_api.txt || true
-          grep -i "shark" output/logs/full_logcat.txt 2>/dev/null | tee output/logs/shark_check.txt || true
-          grep -iE "network.*fail|body is empty|fetch.*failed" output/logs/full_logcat.txt 2>/dev/null | tail -30 | tee output/logs/network_errors.txt || true
+                          c.execute("SELECT COUNT(*) FROM effect")
+                          total = c.fetchone()[0]
+                          self.log(f"特效总数: {total}")
+                          with open("output/logs/rpdb_effects.txt","w") as f:
+                              f.write(f"{total}\n")
+                          db.close()
+                      except Exception as ex:
+                          self.log(f"rp.db 分析失败: {ex}")
 
-          if [ -f output/data/rp_official.db ]; then
-            echo "=== rp.db 面板 ==="
-            sqlite3 -header -column output/data/rp_official.db "SELECT name, version FROM panel_info;" 2>/dev/null | tee output/logs/rpdb_panels.txt || true
-            echo "=== rp.db 分类 ==="
-            sqlite3 -header -column output/data/rp_official.db "SELECT panel, COUNT(*) as cats FROM panel_category GROUP BY panel;" 2>/dev/null | tee output/logs/rpdb_categories.txt || true
-            echo "=== rp.db 特效数 ==="
-            sqlite3 -header -column output/data/rp_official.db "SELECT COUNT(*) as total FROM effect;" 2>/dev/null | tee output/logs/rpdb_effects.txt || true
-          fi
+              def run(self):
+                  self.log("========== 安装与初始化 ==========")
+                  self.adb("install","-t","official.apk")
+                  self.adb("root")
+                  time.sleep(5)
 
-          echo "========== 完成 =========="
-          echo "截图: $(ls output/screenshots/ 2>/dev/null | wc -l)"
-          echo "日志: $(ls output/logs/ 2>/dev/null | wc -l)"
-          echo "数据: $(ls output/data/ 2>/dev/null | wc -l)"
-          BASHEOF
-          chmod +x emu_script.sh
+                  for p in ["READ_EXTERNAL_STORAGE","WRITE_EXTERNAL_STORAGE","READ_MEDIA_VIDEO",
+                           "READ_MEDIA_IMAGES","READ_MEDIA_AUDIO","CAMERA","RECORD_AUDIO","POST_NOTIFICATIONS"]:
+                      self.adb("shell","pm","grant","com.lemon.lvoverseas",f"android.permission.{p}")
 
-      - name: 模拟器侦察与提取
+                  self.adb("push","lv_0_20260226171438.mp4","/sdcard/DCIM/test_video.mp4")
+                  self.adb("shell","am","broadcast","-a",
+                          "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                          "-d","file:///sdcard/DCIM/test_video.mp4")
+                  time.sleep(5)
+
+                  self.log("========== 启动 App ==========")
+                  self.adb("shell","am","start","-n",
+                          "com.lemon.lvoverseas/com.vega.main.MainActivity")
+                  time.sleep(25)
+
+                  self.log("========== 开始状态机导航 ==========")
+                  prev_state = None
+                  stuck_count = 0
+
+                  for i in range(80):
+                      elems = self.get_ui()
+                      state = self.identify(elems)
+
+                      self.log(f"\n--- 迭代 {i+1}/80 | 状态: {state} ---")
+                      for e in elems:
+                          if e['text'] or e['desc']:
+                              lb = e['text'] or f"[{e['desc']}]"
+                              self.log(f"  [{e['x']:>4},{e['y']:>4}] {'C' if e['clickable'] else ' '} \"{lb}\"")
+
+                      self.snap(state.lower())
+
+                      # 检测卡住
+                      if state == prev_state:
+                          stuck_count += 1
+                          if stuck_count > 5:
+                              self.log(f"  ⚠️ 在 {state} 卡了 {stuck_count} 次!")
+                              if stuck_count > 10:
+                                  self.log("  放弃当前状态，强制继续")
+                                  stuck_count = 0
+                                  if state == "TEXT_PANEL":
+                                      for p in self.TARGET_PANELS: self.panels_visited.add(p)
+                      else:
+                          stuck_count = 0
+                      prev_state = state
+
+                      result = self.act(state, elems)
+                      if result == "DONE":
+                          self.log("\n🎉 所有面板已访问！")
+                          break
+
+                      time.sleep(2)
+
+                  # 等待 API
+                  self.log("\n========== 等待 API 完成 (120秒) ==========")
+                  time.sleep(120)
+
+                  self.extract()
+
+                  self.log(f"\n========== 完成 ==========")
+                  self.log(f"截图: {len(os.listdir('output/screenshots'))}")
+                  self.log(f"日志: {len(os.listdir('output/logs'))}")
+                  self.log(f"数据: {len(os.listdir('output/data'))}")
+                  self.log(f"已访问面板: {self.panels_visited}")
+
+          if __name__ == "__main__":
+              Nav().run()
+          NAVIGATOR_EOF
+          chmod +x navigator.py
+          echo "✅ 状态机导航脚本已生成"
+
+      - name: 模拟器状态机导航
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
@@ -387,12 +434,12 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -memory 4096
           disable-animations: true
           emulator-boot-timeout: 600
-          script: bash emu_script.sh
+          script: python3 navigator.py
 
-      - name: 上传侦察结果
+      - name: 上传结果
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-recon-v9
+          name: emulator-recon-v10
           path: output/
           retention-days: 7
