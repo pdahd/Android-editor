@@ -1,4 +1,4 @@
-name: 模拟器提取面板数据 v10 (状态机导航)
+name: 模拟器提取面板数据 v11 (状态机修复)
 
 on:
   workflow_dispatch:
@@ -39,9 +39,12 @@ jobs:
         run: |
           cat > navigator.py << 'NAVIGATOR_EOF'
           #!/usr/bin/env python3
-          """CapCut 状态机导航器 - 看路走路，不盲走"""
+          """CapCut 状态机导航器 v11"""
 
           import subprocess, time, xml.etree.ElementTree as ET, re, os, sys, sqlite3
+
+          PKG = "com.lemon.lvoverseas"
+          ACTIVITY = f"{PKG}/com.vega.main.MainActivity"
 
           class Nav:
               def __init__(self):
@@ -61,6 +64,11 @@ jobs:
                       r = subprocess.run(["adb"]+list(args), capture_output=True, text=True, timeout=30)
                       return r.stdout.strip()
                   except: return ""
+
+              def launch_app(self):
+                  self.log("  🚀 启动 CapCut...")
+                  self.adb("shell","am","start","-n", ACTIVITY)
+                  time.sleep(15)
 
               def snap(self, name):
                   self.step += 1
@@ -82,7 +90,9 @@ jobs:
                   elems = []
                   try:
                       for n in ET.parse("/tmp/nav.xml").iter('node'):
-                          t,d,b = n.get('text',''), n.get('content-desc',''), n.get('bounds','')
+                          t = n.get('text','')
+                          d = n.get('content-desc','')
+                          b = n.get('bounds','')
                           c = n.get('clickable','false')=='true'
                           m = re.findall(r'\d+',b)
                           if len(m)==4:
@@ -93,12 +103,28 @@ jobs:
                   except: pass
                   return elems
 
-              def texts(self, elems):
+              def all_labels(self, elems):
+                  """返回所有文字标签（text和desc合并）"""
                   s = set()
                   for e in elems:
                       if e['text']: s.add(e['text'])
                       if e['desc']: s.add(e['desc'])
                   return s
+
+              def has(self, labels, *keywords):
+                  """检查labels中是否包含任一关键词"""
+                  for kw in keywords:
+                      for lb in labels:
+                          if kw.lower() in lb.lower():
+                              return True
+                  return False
+
+              def has_exact(self, labels, *keywords):
+                  """精确匹配"""
+                  for kw in keywords:
+                      if kw in labels:
+                          return True
+                  return False
 
               def find_tap(self, elems, name, exact=True, click_only=False):
                   for e in elems:
@@ -115,164 +141,215 @@ jobs:
                   return False
 
               def identify(self, elems):
-                  tx = self.texts(elems)
-                  # 按优先级判断
-                  if any("Pixel is starting" in t for t in tx): return "SYSTEM_BOOT"
-                  if "Agree and continue" in tx: return "TOS"
-                  if any("What type of content" in t for t in tx): return "ONBOARDING"
-                  if "Wait" in tx and "Close app" in tx: return "ANR"
-                  if "Sign in & Claim offer" in tx: return "SIGNIN_POPUP"
-                  if any("FREE Pro" in t for t in tx): return "PRO_POPUP"
-                  if "Allow" in tx and any("access" in t.lower() or "permission" in t.lower() or "allow" in t.lower() for t in tx):
-                      # Check if it's a system permission dialog
-                      if any("While using" in t for t in tx): return "PERMISSION"
-                      if any("ALLOW" in t or "DENY" in t or "Don" in t for t in tx): return "PERMISSION"
-                  if "Albums" in tx: return "MEDIA_PICKER"
-                  if "Videos" in tx and "Photos" in tx: return "MEDIA_PICKER"
-                  if any("Add (" in t for t in tx): return "MEDIA_SELECTED"
-                  if "Add text" in tx: return "TEXT_MENU"
-                  # 检查是否在字幕面板
-                  panel_hits = tx & self.TARGET_PANELS
-                  if len(panel_hits) >= 3: return "TEXT_PANEL"
-                  # 编辑器（有Text等工具按钮）
-                  editor_tools = {"Text","Sticker","Audio","Filters","Adjust"}
-                  if len(tx & editor_tools) >= 2: return "EDITOR"
-                  # 看是否有编辑器的 Text 按钮（可能只有少量工具可见）
-                  if "Text" in tx and ("Sticker" in tx or "Audio" in tx): return "EDITOR"
-                  # Edit 主页
-                  if ("New video" in tx or "New project" in tx) and "Projects" in tx: return "EDIT_HOME"
-                  # Templates 推荐页
-                  if ("Search CapCut" in tx or "AutoCut" in tx) and "Templates" in tx: return "TEMPLATES_PAGE"
-                  # 有底部导航栏
-                  if "Edit" in tx and "Templates" in tx and "AI Lab" in tx: return "HAS_NAV"
-                  # Got it / OK 引导
-                  if "Got it" in tx: return "TUTORIAL"
-                  if "OK" in tx and len(tx) < 5: return "TUTORIAL"
+                  lb = self.all_labels(elems)
+
+                  # ===== 系统级状态（最高优先级）=====
+                  if self.has(lb, "Pixel is starting"):
+                      return "SYSTEM_BOOT"
+
+                  if self.has_exact(lb, "Wait") and self.has(lb, "isn't responding"):
+                      return "ANR"
+
+                  # 手机主屏幕（关键特征：Gmail/Chrome/Phone 等系统应用图标）
+                  home_apps = {"Gmail","Chrome","Phone","Messages","Photos","YouTube"}
+                  if len(lb & home_apps) >= 3:
+                      return "PHONE_HOME"
+
+                  # 桌面长按菜单
+                  if self.has_exact(lb, "Wallpaper & style") or self.has_exact(lb, "Widgets"):
+                      return "LAUNCHER_MENU"
+
+                  # 系统权限弹窗
+                  if self.has_exact(lb, "While using the app"):
+                      return "PERMISSION"
+                  if self.has_exact(lb, "Allow") and self.has(lb, "access","allow","permission","want to"):
+                      return "PERMISSION"
+
+                  # ===== CapCut 应用级状态 =====
+                  if self.has_exact(lb, "Agree and continue"):
+                      return "TOS"
+
+                  if self.has(lb, "What type of content"):
+                      return "ONBOARDING"
+
+                  if self.has_exact(lb, "Sign in & Claim offer"):
+                      return "SIGNIN_POPUP"
+
+                  if self.has(lb, "FREE Pro"):
+                      return "PRO_POPUP"
+
+                  # 媒体选择器
+                  if self.has_exact(lb, "Albums") or (self.has_exact(lb,"Videos") and self.has_exact(lb,"Photos") and self.has(lb,"00:")):
+                      return "MEDIA_PICKER"
+
+                  # 已选择媒体（Add按钮变成 Add(1)）
+                  if any("Add (" in t for t in lb):
+                      return "MEDIA_SELECTED"
+
+                  # 文字编辑子菜单
+                  if self.has_exact(lb, "Add text"):
+                      return "TEXT_MENU"
+
+                  # 字幕面板（多个面板标签同时可见）
+                  panel_hits = lb & self.TARGET_PANELS
+                  if len(panel_hits) >= 3:
+                      return "TEXT_PANEL"
+
+                  # 编辑器（工具栏）
+                  editor_tools = {"Text","Sticker","Audio","Filters","Adjust","Effects"}
+                  if len(lb & editor_tools) >= 2:
+                      return "EDITOR"
+
+                  # Edit主页（有New video/New project + Projects）
+                  if (self.has_exact(lb,"New video") or self.has_exact(lb,"New project")) and self.has_exact(lb,"Projects"):
+                      return "EDIT_HOME"
+
+                  # Templates推荐页（Search CapCut + 底部有Edit标签）
+                  if self.has(lb,"Search CapCut","AutoCut") and self.has_exact(lb,"Templates"):
+                      return "TEMPLATES_PAGE"
+
+                  # 有底部导航栏但无法确定具体页面
+                  if self.has_exact(lb,"Edit") and self.has_exact(lb,"Templates") and self.has_exact(lb,"AI Lab"):
+                      return "HAS_NAV"
+
+                  # 引导/教程
+                  if self.has_exact(lb, "Got it"):
+                      return "TUTORIAL"
+
                   return "UNKNOWN"
 
               def act(self, state, elems):
-                  tx = self.texts(elems)
+                  lb = self.all_labels(elems)
 
                   if state == "SYSTEM_BOOT":
-                      self.log("  等待系统启动...")
-                      time.sleep(15)
-                      self.adb("shell","am","start","-n",
-                              "com.lemon.lvoverseas/com.vega.main.MainActivity")
-                      time.sleep(10)
+                      self.log("  ⏳ 系统启动中，等待...")
+                      time.sleep(20)
+                      self.launch_app()
+
+                  elif state == "PHONE_HOME":
+                      self.log("  📱 在手机主屏幕，启动 CapCut")
+                      self.launch_app()
+
+                  elif state == "LAUNCHER_MENU":
+                      self.log("  📱 桌面菜单弹出，关闭后启动 CapCut")
+                      self.tap(540, 1800, "点空白处关闭菜单")
+                      time.sleep(3)
+                      self.launch_app()
+
+                  elif state == "ANR":
+                      self.log("  ⚠️ ANR！点 Close app 然后重新启动 CapCut")
+                      self.find_tap(elems, "Close app", click_only=True)
+                      time.sleep(5)
+                      self.launch_app()
 
                   elif state == "TOS":
-                      self.find_tap(elems,"Agree and continue",click_only=True)
+                      self.find_tap(elems, "Agree and continue", click_only=True)
                       time.sleep(8)
 
                   elif state == "ONBOARDING":
-                      self.find_tap(elems,"Skip",click_only=True)
-                      time.sleep(5)
-
-                  elif state == "ANR":
-                      self.find_tap(elems,"Wait",click_only=True)
+                      self.find_tap(elems, "Skip", click_only=True)
                       time.sleep(5)
 
                   elif state == "SIGNIN_POPUP":
-                      self.tap(1025,1382,"关闭❌登录弹窗")
+                      self.tap(1025, 1382, "关闭❌登录弹窗")
                       time.sleep(5)
 
                   elif state == "PRO_POPUP":
-                      self.tap(1025,1382,"关闭❌Pro弹窗")
+                      self.tap(1025, 1382, "关闭❌Pro弹窗")
                       time.sleep(5)
 
                   elif state == "PERMISSION":
-                      if not self.find_tap(elems,"While using the app",click_only=True):
-                          if not self.find_tap(elems,"Allow",click_only=True):
-                              if not self.find_tap(elems,"ALLOW",click_only=True):
-                                  self.find_tap(elems,"Don't allow",click_only=True)
+                      if not self.find_tap(elems, "While using the app", click_only=True):
+                          if not self.find_tap(elems, "Allow", click_only=True):
+                              self.find_tap(elems, "ALLOW", click_only=True)
                       time.sleep(5)
 
                   elif state == "TEMPLATES_PAGE":
-                      self.find_tap(elems,"Edit",exact=True,click_only=True)
+                      self.log("  📄 在 Templates 页，切到 Edit")
+                      self.find_tap(elems, "Edit", exact=True, click_only=True)
                       time.sleep(5)
 
                   elif state == "EDIT_HOME":
-                      if not self.find_tap(elems,"New project"):
-                          self.find_tap(elems,"New video")
+                      self.log("  🏠 在 Edit 主页，点击 New video/project")
+                      if not self.find_tap(elems, "New project"):
+                          self.find_tap(elems, "New video")
                       time.sleep(8)
 
                   elif state == "HAS_NAV":
-                      self.find_tap(elems,"Edit",exact=True,click_only=True)
+                      self.log("  📍 有底部导航，切到 Edit")
+                      self.find_tap(elems, "Edit", exact=True, click_only=True)
                       time.sleep(5)
 
                   elif state == "MEDIA_PICKER":
-                      self.log("  选择视频流程...")
-                      self.tap(226,426,"勾选视频")
+                      self.log("  🎬 媒体选择器，选择视频")
+                      self.tap(226, 426, "勾选视频")
                       time.sleep(3)
-                      self.tap(944,1931,"勾选HD")
+                      self.tap(944, 1931, "勾选HD")
                       time.sleep(2)
-                      # 重新读取UI看Add按钮
                       elems2 = self.get_ui()
-                      if not self.find_tap(elems2,"Add (1)",click_only=True):
-                          if not self.find_tap(elems2,"Add",exact=True,click_only=True):
-                              self.tap(946,2027,"Add按钮位置")
+                      if not self.find_tap(elems2, "Add (1)", click_only=True):
+                          if not self.find_tap(elems2, "Add", exact=True, click_only=True):
+                              self.tap(946, 2027, "Add按钮位置")
                       time.sleep(15)
 
                   elif state == "MEDIA_SELECTED":
-                      self.find_tap(elems,"Add",exact=False,click_only=True)
+                      self.find_tap(elems, "Add", exact=False, click_only=True)
                       time.sleep(15)
 
                   elif state == "EDITOR":
-                      # 先处理可能的引导
-                      if self.find_tap(elems,"Got it",click_only=True):
+                      if self.find_tap(elems, "Got it", click_only=True):
                           time.sleep(3)
-                      elif self.find_tap(elems,"Text",exact=True):
+                      else:
+                          self.log("  ✏️ 编辑器，点击 Text")
+                          self.find_tap(elems, "Text", exact=True)
                           time.sleep(5)
 
                   elif state == "TEXT_MENU":
-                      self.find_tap(elems,"Add text")
+                      self.log("  📝 Text 菜单，点击 Add text")
+                      self.find_tap(elems, "Add text")
                       time.sleep(5)
-                      self.adb("shell","input","keyevent","111")  # Escape关键盘
+                      self.adb("shell", "input", "keyevent", "111")
                       time.sleep(3)
 
                   elif state == "TEXT_PANEL":
                       remaining = self.TARGET_PANELS - self.panels_visited
                       if not remaining:
                           return "DONE"
-                      # 找一个存在于当前UI中的面板
-                      for p in list(remaining):
-                          if p in self.texts(elems):
+                      for p in sorted(remaining):
+                          if p in lb:
+                              self.log(f"  🎯 点击面板: {p}")
                               self.find_tap(elems, p, exact=True)
                               self.panels_visited.add(p)
                               time.sleep(10)
-                              # 检查 effectchannel
-                              r = self.adb("shell","ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null")
+                              r = self.adb("shell",
+                                  "ls /data/data/com.lemon.lvoverseas/files/effect/effectchannel* 2>/dev/null")
                               self.log(f"  effectchannel: {r or '无'}")
                               break
                       else:
-                          # 没找到未访问的面板，标记全部完成
-                          for p in remaining:
-                              self.panels_visited.add(p)
+                          for p in remaining: self.panels_visited.add(p)
 
                   elif state == "TUTORIAL":
-                      if not self.find_tap(elems,"Got it",click_only=True):
-                          if not self.find_tap(elems,"OK",click_only=True):
-                              self.find_tap(elems,"Skip",click_only=True)
+                      if not self.find_tap(elems, "Got it", click_only=True):
+                          self.find_tap(elems, "OK", click_only=True)
                       time.sleep(3)
 
                   elif state == "UNKNOWN":
-                      self.log("  未知状态，尝试恢复...")
-                      # 尝试常见按钮
-                      for btn in ["Got it","OK","Skip","Allow","Close","Cancel",
-                                  "Not now","Later","Don't allow","Dismiss"]:
-                          if self.find_tap(elems,btn,click_only=True):
+                      self.log("  ❓ 未知状态，尝试恢复")
+                      # 优先尝试常见弹窗按钮
+                      for btn in ["Got it","OK","Skip","Close","Cancel","Not now",
+                                  "Later","Dismiss","No thanks","Maybe later"]:
+                          if self.find_tap(elems, btn, click_only=True):
                               time.sleep(3)
                               return None
-                      # 检查App是否在运行
-                      pid = self.adb("shell","pidof","com.lemon.lvoverseas")
+                      # 都没找到，检查 App 是否运行
+                      pid = self.adb("shell","pidof",PKG)
                       if not pid:
-                          self.log("  App未运行，重启...")
-                          self.adb("shell","am","start","-n",
-                                  "com.lemon.lvoverseas/com.vega.main.MainActivity")
-                          time.sleep(15)
+                          self.log("  App 未运行，重新启动")
+                          self.launch_app()
                       else:
-                          time.sleep(5)
-
+                          # App 在运行但界面未知，尝试把 App 拉到前台
+                          self.log("  App 在运行但界面未知，重新拉起")
+                          self.launch_app()
                   return None
 
               def extract(self):
@@ -281,23 +358,24 @@ jobs:
                   self.log(f"effect目录:\n{r}")
                   with open("output/logs/final_effect_dir.txt","w") as f: f.write(r)
 
-                  r = self.adb("shell","find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 "
-                              "\\( -name 'effectchannel*' -o -name 'effect_version*' \\) -exec ls -la {} \\;")
+                  r = self.adb("shell",
+                      "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 "
+                      "\\( -name 'effectchannel*' -o -name 'effect_version*' \\) -exec ls -la {} \\;")
                   self.log(f"channels:\n{r}")
                   with open("output/logs/final_channels.txt","w") as f: f.write(r)
 
-                  r = self.adb("shell","ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null")
+                  r = self.adb("shell",
+                      "ls -la /data/data/com.lemon.lvoverseas/files/resources/db/rp.db 2>/dev/null")
                   self.log(f"rp.db: {r}")
                   with open("output/logs/final_rpdb.txt","w") as f: f.write(r)
 
-                  # 提取 rp.db
                   subprocess.run(["adb","pull",
-                                 "/data/data/com.lemon.lvoverseas/files/resources/db/rp.db",
-                                 "output/data/rp_official.db"], capture_output=True)
+                      "/data/data/com.lemon.lvoverseas/files/resources/db/rp.db",
+                      "output/data/rp_official.db"], capture_output=True)
 
-                  # 提取 effectchannel
-                  channels = self.adb("shell","find /data/data/com.lemon.lvoverseas/files/effect/ "
-                                     "-maxdepth 1 \\( -name 'effectchannel*' -o -name 'effect_version*' \\)")
+                  channels = self.adb("shell",
+                      "find /data/data/com.lemon.lvoverseas/files/effect/ -maxdepth 1 "
+                      "\\( -name 'effectchannel*' -o -name 'effect_version*' \\)")
                   for f in channels.split('\n'):
                       f = f.strip().replace('\r','')
                       if f:
@@ -305,44 +383,38 @@ jobs:
                           self.log(f"  提取: {fname}")
                           subprocess.run(["adb","pull",f,f"output/data/{fname}"],capture_output=True)
 
-                  # 日志
                   self.log("--- 提取 logcat ---")
                   logcat = self.adb("shell","logcat","-d")
                   with open("output/logs/full_logcat.txt","w") as f: f.write(logcat)
 
-                  for tag, pattern in [("respool","respool"),("effect_api","effect.*panel|category/effects|get_panel_info"),
-                                       ("shark","shark"),("network_errors","network.*fail|body is empty|fetch.*failed")]:
-                      import re as re2
-                      lines = [l for l in logcat.split('\n') if re2.search(pattern, l, re2.I)]
+                  for tag, pattern in [
+                      ("respool","respool"),
+                      ("effect_api","effect.*panel|category/effects|get_panel_info"),
+                      ("shark","shark"),
+                      ("network_errors","network.*fail|body is empty|fetch.*failed")
+                  ]:
+                      lines = [l for l in logcat.split('\n') if re.search(pattern, l, re.I)]
                       with open(f"output/logs/{tag}.txt","w") as f: f.write('\n'.join(lines[-80:]))
                       if lines: self.log(f"  {tag}: {len(lines)} 行")
 
-                  # 分析 rp.db
                   if os.path.exists("output/data/rp_official.db"):
                       self.log("\n=== rp.db 分析 ===")
                       try:
                           db = sqlite3.connect("output/data/rp_official.db")
                           c = db.cursor()
-                          c.execute("SELECT name, version FROM panel_info")
-                          rows = c.fetchall()
-                          self.log(f"面板: {rows}")
-                          with open("output/logs/rpdb_panels.txt","w") as f:
-                              for r in rows: f.write(f"{r[0]}\t{r[1]}\n")
-
-                          c.execute("SELECT panel, COUNT(*) FROM panel_category GROUP BY panel")
-                          rows = c.fetchall()
-                          self.log(f"分类: {rows}")
-                          with open("output/logs/rpdb_categories.txt","w") as f:
-                              for r in rows: f.write(f"{r[0]}\t{r[1]}\n")
-
-                          c.execute("SELECT COUNT(*) FROM effect")
-                          total = c.fetchone()[0]
-                          self.log(f"特效总数: {total}")
-                          with open("output/logs/rpdb_effects.txt","w") as f:
-                              f.write(f"{total}\n")
+                          for q, name, fn in [
+                              ("SELECT name, version FROM panel_info","面板","rpdb_panels.txt"),
+                              ("SELECT panel, COUNT(*) FROM panel_category GROUP BY panel","分类","rpdb_categories.txt"),
+                              ("SELECT COUNT(*) FROM effect","特效数","rpdb_effects.txt"),
+                          ]:
+                              c.execute(q)
+                              rows = c.fetchall()
+                              self.log(f"  {name}: {rows}")
+                              with open(f"output/logs/{fn}","w") as f:
+                                  for r in rows: f.write(f"{r}\n")
                           db.close()
                       except Exception as ex:
-                          self.log(f"rp.db 分析失败: {ex}")
+                          self.log(f"  rp.db 分析失败: {ex}")
 
               def run(self):
                   self.log("========== 安装与初始化 ==========")
@@ -351,8 +423,9 @@ jobs:
                   time.sleep(5)
 
                   for p in ["READ_EXTERNAL_STORAGE","WRITE_EXTERNAL_STORAGE","READ_MEDIA_VIDEO",
-                           "READ_MEDIA_IMAGES","READ_MEDIA_AUDIO","CAMERA","RECORD_AUDIO","POST_NOTIFICATIONS"]:
-                      self.adb("shell","pm","grant","com.lemon.lvoverseas",f"android.permission.{p}")
+                           "READ_MEDIA_IMAGES","READ_MEDIA_AUDIO","CAMERA","RECORD_AUDIO",
+                           "POST_NOTIFICATIONS"]:
+                      self.adb("shell","pm","grant",PKG,f"android.permission.{p}")
 
                   self.adb("push","lv_0_20260226171438.mp4","/sdcard/DCIM/test_video.mp4")
                   self.adb("shell","am","broadcast","-a",
@@ -361,9 +434,7 @@ jobs:
                   time.sleep(5)
 
                   self.log("========== 启动 App ==========")
-                  self.adb("shell","am","start","-n",
-                          "com.lemon.lvoverseas/com.vega.main.MainActivity")
-                  time.sleep(25)
+                  self.launch_app()
 
                   self.log("========== 开始状态机导航 ==========")
                   prev_state = None
@@ -372,25 +443,26 @@ jobs:
                   for i in range(80):
                       elems = self.get_ui()
                       state = self.identify(elems)
+                      lb = self.all_labels(elems)
 
-                      self.log(f"\n--- 迭代 {i+1}/80 | 状态: {state} ---")
+                      self.log(f"\n--- 迭代 {i+1}/80 | 状态: {state} | 已访问面板: {len(self.panels_visited)}/{len(self.TARGET_PANELS)} ---")
                       for e in elems:
                           if e['text'] or e['desc']:
-                              lb = e['text'] or f"[{e['desc']}]"
-                              self.log(f"  [{e['x']:>4},{e['y']:>4}] {'C' if e['clickable'] else ' '} \"{lb}\"")
+                              tag = e['text'] or f"[{e['desc']}]"
+                              self.log(f"  [{e['x']:>4},{e['y']:>4}] {'C' if e['clickable'] else ' '} \"{tag}\"")
 
                       self.snap(state.lower())
 
-                      # 检测卡住
                       if state == prev_state:
                           stuck_count += 1
-                          if stuck_count > 5:
-                              self.log(f"  ⚠️ 在 {state} 卡了 {stuck_count} 次!")
-                              if stuck_count > 10:
-                                  self.log("  放弃当前状态，强制继续")
-                                  stuck_count = 0
-                                  if state == "TEXT_PANEL":
-                                      for p in self.TARGET_PANELS: self.panels_visited.add(p)
+                          if stuck_count > 3:
+                              self.log(f"  ⚠️ 在 {state} 卡了 {stuck_count} 次")
+                          if stuck_count > 8:
+                              self.log("  🔄 强制重启 App")
+                              self.adb("shell","am","force-stop",PKG)
+                              time.sleep(3)
+                              self.launch_app()
+                              stuck_count = 0
                       else:
                           stuck_count = 0
                       prev_state = state
@@ -402,7 +474,6 @@ jobs:
 
                       time.sleep(2)
 
-                  # 等待 API
                   self.log("\n========== 等待 API 完成 (120秒) ==========")
                   time.sleep(120)
 
@@ -417,8 +488,7 @@ jobs:
           if __name__ == "__main__":
               Nav().run()
           NAVIGATOR_EOF
-          chmod +x navigator.py
-          echo "✅ 状态机导航脚本已生成"
+          echo "✅ v11 导航脚本已生成"
 
       - name: 模拟器状态机导航
         uses: reactivecircus/android-emulator-runner@v2
@@ -440,6 +510,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-recon-v10
+          name: emulator-recon-v11
           path: output/
           retention-days: 7
