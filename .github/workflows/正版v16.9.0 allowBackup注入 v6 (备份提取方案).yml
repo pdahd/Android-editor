@@ -1,0 +1,226 @@
+name: 正版v16.9.0 allowBackup注入 v6 (备份提取方案)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+          ls -la official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 二进制修改 Manifest (allowBackup + debuggable)
+        run: |
+          mkdir -p work
+          unzip -o official.apk AndroidManifest.xml -d work/
+
+          python3 << 'PYEOF'
+          import struct, sys
+
+          with open("work/AndroidManifest.xml", "rb") as f:
+              data = bytearray(f.read())
+
+          print(f"文件大小: {len(data)} bytes")
+
+          # ===== 解析 String Pool =====
+          SP = 8
+          sp_chunk_size = struct.unpack_from('<I', data, SP + 4)[0]
+          sp_str_count = struct.unpack_from('<I', data, SP + 8)[0]
+          sp_hdr_sz = struct.unpack_from('<H', data, SP + 2)[0]
+          sp_flags = struct.unpack_from('<I', data, SP + 16)[0]
+          sp_str_start = struct.unpack_from('<I', data, SP + 20)[0]
+          is_utf8 = bool(sp_flags & 0x100)
+
+          OFF_BASE = SP + sp_hdr_sz
+          STR_BASE = SP + sp_str_start
+          RID_START = SP + sp_chunk_size
+
+          print(f"StringPool: {sp_str_count} strings, {'UTF-8' if is_utf8 else 'UTF-16'}")
+
+          # ===== 读取所有字符串 =====
+          strings = {}
+          for i in range(sp_str_count):
+              rel = struct.unpack_from('<I', data, OFF_BASE + i * 4)[0]
+              pos = STR_BASE + rel
+              try:
+                  if is_utf8:
+                      p = pos
+                      cc = data[p]; p += 1
+                      if cc & 0x80: p += 1
+                      bc = data[p]; p += 1
+                      if bc & 0x80: bc = ((bc & 0x7F) << 8) | data[p]; p += 1
+                      s = data[p:p+bc].decode('utf-8')
+                  else:
+                      p = pos
+                      cc = struct.unpack_from('<H', data, p)[0]; p += 2
+                      if cc & 0x8000:
+                          cc = ((cc & 0x7FFF) << 16) | struct.unpack_from('<H', data, p)[0]; p += 2
+                      s = data[p:p+cc*2].decode('utf-16-le')
+                  strings[i] = s
+              except:
+                  strings[i] = f"<error@{i}>"
+
+          # ===== 读取 Resource ID 表 =====
+          rid_chunk_size = struct.unpack_from('<I', data, RID_START + 4)[0]
+          rid_count = (rid_chunk_size - 8) // 4
+          print(f"ResourceID表: {rid_count} 个条目")
+
+          rid_to_idx = {}
+          for i in range(rid_count):
+              rid = struct.unpack_from('<I', data, RID_START + 8 + i * 4)[0]
+              rid_to_idx[rid] = i
+
+          # 找关键字符串的 index
+          allowBackup_idx = -1
+          debuggable_str_idx = -1
+          for idx, s in strings.items():
+              if s == "allowBackup":
+                  allowBackup_idx = idx
+              if s == "debuggable":
+                  debuggable_str_idx = idx
+
+          print(f"allowBackup string index: {allowBackup_idx}")
+          print(f"debuggable string index: {debuggable_str_idx}")
+
+          # ===== 扫描所有 XML 元素，找到 <application> 的属性 =====
+          pos = RID_START + rid_chunk_size
+          changes = []
+
+          while pos < len(data) - 8:
+              c_type = struct.unpack_from('<H', data, pos)[0]
+              c_hdr = struct.unpack_from('<H', data, pos + 2)[0]
+              c_size = struct.unpack_from('<I', data, pos + 4)[0]
+
+              if c_size < 8 or pos + c_size > len(data):
+                  break
+
+              if c_type == 0x0102:  # START_ELEMENT
+                  ns_idx = struct.unpack_from('<i', data, pos + 8)[0]
+                  name_idx = struct.unpack_from('<I', data, pos + 12)[0]
+                  attr_start = struct.unpack_from('<H', data, pos + 24)[0]
+                  attr_size = struct.unpack_from('<H', data, pos + 26)[0]
+                  attr_count = struct.unpack_from('<H', data, pos + 28)[0]
+                  if attr_size == 0: attr_size = 20
+
+                  elem_name = strings.get(name_idx, f"?{name_idx}")
+                  a_base = pos + 16 + attr_start
+
+                  if elem_name == "application":
+                      print(f"\n=== <application> 元素 @ {pos} ===")
+                      print(f"    属性数: {attr_count}, 属性大小: {attr_size}")
+
+                      for ai in range(attr_count):
+                          ao = a_base + ai * attr_size
+                          if ao + 20 > len(data): break
+
+                          a_ns = struct.unpack_from('<I', data, ao)[0]
+                          a_name = struct.unpack_from('<I', data, ao + 4)[0]
+                          a_raw = struct.unpack_from('<I', data, ao + 8)[0]
+                          a_type = data[ao + 15]
+                          a_val = struct.unpack_from('<i', data, ao + 16)[0]
+
+                          attr_name_str = strings.get(a_name, f"?{a_name}")
+                          print(f"    [{ai:2d}] name_idx={a_name:3d} ({attr_name_str:40s}) "
+                                f"type=0x{a_type:02X} value={a_val}")
+
+                          # 修改 allowBackup: false → true
+                          if a_name == allowBackup_idx and a_type == 0x12 and a_val == 0:
+                              struct.pack_into('<i', data, ao + 16, -1)
+                              changes.append(f"allowBackup: false → true @ {ao+16}")
+                              print(f"         ✅ → 改为 true")
+
+                      # 检查属性列表中有没有存储资源 ID 的字段
+                      print(f"\n    --- 属性原始字节 (前3个) ---")
+                      for ai in range(min(3, attr_count)):
+                          ao = a_base + ai * attr_size
+                          hex_bytes = ' '.join(f'{data[ao+b]:02X}' for b in range(attr_size))
+                          print(f"    [{ai}] {hex_bytes}")
+
+              pos += c_size
+
+          # 写回
+          with open("work/AndroidManifest.xml", "wb") as f:
+              f.write(data)
+
+          print(f"\n修改数: {len(changes)}")
+          for c in changes:
+              print(f"  ✅ {c}")
+
+          print(f"\n文件大小: {len(data)} bytes (未变)")
+          PYEOF
+
+      - name: 组装 APK
+        run: |
+          cp official.apk capcut_v16.9_v6.apk
+          zip -d capcut_v16.9_v6.apk "META-INF/*" 2>/dev/null || true
+          cd work
+          zip -0 ../capcut_v16.9_v6.apk AndroidManifest.xml
+          cd ..
+          ls -la capcut_v16.9_v6.apk
+
+      - name: 对齐 + 签名
+        run: |
+          ZIPALIGN=$(find "$ANDROID_HOME" -name zipalign -type f | sort -V | tail -1)
+          APKSIGNER=$(find "$ANDROID_HOME" -name apksigner -type f | sort -V | tail -1)
+
+          KS_PASS="$(printf '%s' "${{ secrets.ANDROID_KEYSTORE_PASS }}" | tr -d '\r\n')"
+          ALIAS="$(printf '%s' "${{ secrets.ANDROID_KEY_ALIAS }}" | tr -d '\r\n ')"
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > release.jks
+
+          "$ZIPALIGN" -p -f 4 capcut_v16.9_v6.apk aligned.apk
+
+          "$APKSIGNER" sign \
+            --ks release.jks \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            --key-pass pass:"$KS_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --min-sdk-version 23 \
+            --out capcut_v16.9_v6_signed.apk \
+            aligned.apk
+
+          echo "=== 签名验证 ==="
+          "$APKSIGNER" verify -v capcut_v16.9_v6_signed.apk | head -10
+
+          echo ""
+          echo "=== aapt 完整 dump ==="
+          AAPT=$(find "$ANDROID_HOME" -name "aapt" -not -name "aapt2" -type f | sort -V | tail -1)
+          "$AAPT" dump badging capcut_v16.9_v6_signed.apk 2>&1 | grep -iE "debuggable|package:|allowBackup" || true
+
+          ls -la capcut_v16.9_v6_signed.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: capcut-v16.9-v6
+          path: capcut_v16.9_v6_signed.apk
+          retention-days: 7
