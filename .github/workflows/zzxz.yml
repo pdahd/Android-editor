@@ -1,0 +1,387 @@
+name: v16.9.0-v10
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 反编译 DEX (跳过资源)
+        run: |
+          java -jar apktool.jar d -f -r official.apk -o smali_work > /dev/null 2>&1 || true
+          echo "smali 目录数: $(ls -d smali_work/smali_classes* 2>/dev/null | wc -l)"
+
+      - name: Patch 1 - vega CrackingInterceptor (native → pass-through)
+        run: |
+          TARGET="smali_work/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor.smali"
+          if [ ! -f "$TARGET" ]; then
+            echo "❌ 文件不存在！"
+            exit 1
+          fi
+
+          python3 << 'PYEOF'
+          import re
+
+          with open("smali_work/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor.smali", "r") as f:
+              content = f.read()
+
+          # 1. Replace native intercept() with pass-through
+          old_intercept = re.search(
+              r'\.method public final native intercept\(.*?\)Lcom/bytedance/retrofit2/SsResponse;.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_intercept = """.method public final intercept(Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;)Lcom/bytedance/retrofit2/SsResponse;
+            .locals 1
+            .annotation system Ldalvik/annotation/Signature;
+            value = {
+            "(",
+            "Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;",
+            ")",
+            "Lcom/bytedance/retrofit2/SsResponse<",
+            "*>;"
+            }
+            .end annotation
+
+            # PATCHED: bypass all cracking checks, just pass through
+            invoke-interface {p1}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->request()Lcom/bytedance/retrofit2/client/Request;
+            move-result-object v0
+            invoke-interface {p1, v0}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->proceed(Lcom/bytedance/retrofit2/client/Request;)Lcom/bytedance/retrofit2/SsResponse;
+            move-result-object v0
+            return-object v0
+            .end method"""
+
+          if old_intercept:
+              content = content[:old_intercept.start()] + new_intercept + content[old_intercept.end():]
+              print("✅ intercept() native → pass-through")
+          else:
+              print("❌ intercept() 未找到")
+
+          # 2. Replace native c(String)V with empty return
+          old_c = re.search(
+              r'\.method public final native c\(Ljava/lang/String;\)V\s*\.end method',
+              content, re.DOTALL
+          )
+
+          new_c = """.method public final c(Ljava/lang/String;)V
+          .locals 0
+          # PATCHED: neutralized native cracking report
+          return-void
+          .end method"""
+
+          if old_c:
+              content = content[:old_c.start()] + new_c + content[old_c.end():]
+              print("✅ c(String)V native → empty")
+          else:
+              print("⚠️ c(String)V 未找到")
+
+          # 3. Replace b(I)V to not store isCracking=true
+          old_b = re.search(
+              r'\.method public final b\(I\)V.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_b = """.method public final b(I)V
+          .locals 0
+          # PATCHED: don't store isCracking flag
+          return-void
+          .end method"""
+
+          if old_b:
+              content = content[:old_b.start()] + new_b + content[old_b.end():]
+              print("✅ b(I)V → empty (no isCracking storage)")
+          else:
+              print("⚠️ b(I)V 未找到")
+
+          with open("smali_work/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor.smali", "w") as f:
+              f.write(content)
+
+          print("✅ vega CrackingInterceptor 补丁完成")
+          PYEOF
+
+      - name: Patch 2 - xt.retouch CrackingInterceptor (ret code check → pass-through)
+        run: |
+          TARGET="smali_work/smali_classes7/com/xt/retouch/applauncher/core/interceptor/CrackingInterceptor.smali"
+          if [ ! -f "$TARGET" ]; then
+            echo "⚠️ xt.retouch 版本不存在，跳过"
+            exit 0
+          fi
+
+          python3 << 'PYEOF'
+          import re
+
+          with open("smali_work/smali_classes7/com/xt/retouch/applauncher/core/interceptor/CrackingInterceptor.smali", "r") as f:
+              content = f.read()
+
+          # Replace intercept() - remove ret code checking, just pass through
+          old_intercept = re.search(
+              r'# virtual methods\s*\.method public final intercept\(Lcom/bytedance/retrofit2/intercept/Interceptor\$Chain;\)Lcom/bytedance/retrofit2/SsResponse;.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_intercept = """# virtual methods
+          .method public final intercept(Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;)Lcom/bytedance/retrofit2/SsResponse;
+          .locals 1
+          .annotation system Ldalvik/annotation/Signature;
+          value = {
+            "(",
+            "Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;",
+            ")",
+            "Lcom/bytedance/retrofit2/SsResponse<",
+            "*>;"
+          }
+          .end annotation
+
+          # PATCHED: bypass ret code checks, just pass through
+          invoke-interface {p1}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->request()Lcom/bytedance/retrofit2/client/Request;
+          move-result-object v0
+          invoke-interface {p1, v0}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->proceed(Lcom/bytedance/retrofit2/client/Request;)Lcom/bytedance/retrofit2/SsResponse;
+          move-result-object v0
+          return-object v0
+          .end method"""
+
+          if old_intercept:
+              content = content[:old_intercept.start()] + new_intercept + content[old_intercept.end():]
+              print("✅ xt.retouch intercept() → pass-through")
+          else:
+              print("❌ xt.retouch intercept() 未找到")
+
+          with open("smali_work/smali_classes7/com/xt/retouch/applauncher/core/interceptor/CrackingInterceptor.smali", "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: 重新编译 DEX
+        run: |
+          java -jar apktool.jar b smali_work -o temp_dex.apk > /dev/null 2>&1 || true
+
+          echo "=== 检查编译输出 ==="
+          ls -la temp_dex.apk 2>/dev/null || echo "❌ 编译失败"
+
+          if [ -f temp_dex.apk ]; then
+            mkdir -p patched_dex
+            # CrackingInterceptor 在 classes7
+            unzip -o temp_dex.apk classes7.dex -d patched_dex/ 2>/dev/null
+            echo "=== 提取的 DEX ==="
+            ls -la patched_dex/
+          fi
+
+      - name: 二进制修改 Manifest (debuggable + allowBackup)
+        run: |
+          mkdir -p work
+          unzip -o official.apk AndroidManifest.xml -d work/
+
+          python3 << 'PYEOF'
+          import struct, sys
+
+          RESID_DEBUGGABLE = 0x0101000f
+
+          with open("work/AndroidManifest.xml", "rb") as f:
+              data = bytearray(f.read())
+
+          SP = 8
+          sp_chunk_size = struct.unpack_from('<I', data, SP + 4)[0]
+          sp_str_count = struct.unpack_from('<I', data, SP + 8)[0]
+          sp_hdr_sz = struct.unpack_from('<H', data, SP + 2)[0]
+          sp_flags = struct.unpack_from('<I', data, SP + 16)[0]
+          sp_str_start = struct.unpack_from('<I', data, SP + 20)[0]
+          is_utf8 = bool(sp_flags & 0x100)
+
+          OFF_BASE = SP + sp_hdr_sz
+          STR_BASE = SP + sp_str_start
+
+          str_info = {}
+          for i in range(sp_str_count):
+              rel = struct.unpack_from('<I', data, OFF_BASE + i * 4)[0]
+              pos = STR_BASE + rel
+              try:
+                  p = pos
+                  cc = struct.unpack_from('<H', data, p)[0]; p += 2
+                  if cc & 0x8000:
+                      cc = ((cc & 0x7FFF) << 16) | struct.unpack_from('<H', data, p)[0]; p += 2
+                  s = data[p:p+cc*2].decode('utf-16-le')
+                  str_info[i] = (s, pos, p + cc * 2 + 2)
+              except:
+                  str_info[i] = ("<error>", pos, pos)
+
+          native_heap_idx = -1
+          allow_backup_idx = -1
+          for idx, (s, _, _) in str_info.items():
+              if s == "allowNativeHeapPointerTagging": native_heap_idx = idx
+              elif s == "allowBackup": allow_backup_idx = idx
+
+          RID_START = SP + sp_chunk_size
+          rid_chunk_size = struct.unpack_from('<I', data, RID_START + 4)[0]
+          rid_count = (rid_chunk_size - 8) // 4
+
+          rid_table = {}
+          for i in range(rid_count):
+              rid = struct.unpack_from('<I', data, RID_START + 8 + i * 4)[0]
+              rid_table[i] = rid
+
+          # Modify ResID table
+          if native_heap_idx >= 0 and native_heap_idx < rid_count:
+              struct.pack_into('<I', data, RID_START + 8 + native_heap_idx * 4, RESID_DEBUGGABLE)
+              rid_table[native_heap_idx] = RESID_DEBUGGABLE
+              print(f"✅ ResID[{native_heap_idx}] → debuggable")
+
+          # Modify string
+          if native_heap_idx >= 0:
+              s, start, end = str_info[native_heap_idx]
+              wp = start
+              new_name = "debuggable"
+              new_u = new_name.encode('utf-16-le')
+              struct.pack_into('<H', data, wp, len(new_name)); wp += 2
+              for j, b in enumerate(new_u): data[wp + j] = b
+              wp += len(new_u)
+              struct.pack_into('<H', data, wp, 0); wp += 2
+              while wp < end: data[wp] = 0; wp += 1
+              print(f"✅ 字符串 → debuggable")
+
+          # Scan and modify attributes + sort
+          pos = RID_START + rid_chunk_size
+          while pos < len(data) - 8:
+              c_type = struct.unpack_from('<H', data, pos)[0]
+              c_size = struct.unpack_from('<I', data, pos + 4)[0]
+              if c_size < 8 or pos + c_size > len(data): break
+
+              if c_type == 0x0102:
+                  elem_name_idx = struct.unpack_from('<I', data, pos + 20)[0]
+                  attr_start_off = struct.unpack_from('<H', data, pos + 24)[0]
+                  attr_size = struct.unpack_from('<H', data, pos + 26)[0]
+                  attr_count = struct.unpack_from('<H', data, pos + 28)[0]
+                  if attr_size == 0: attr_size = 20
+
+                  elem_name_str = str_info.get(elem_name_idx, ("<?>",))[0]
+                  a_base = pos + 16 + attr_start_off
+
+                  if elem_name_str == "application":
+                      for ai in range(attr_count):
+                          ao = a_base + ai * attr_size
+                          if ao + 20 > len(data): break
+                          a_name = struct.unpack_from('<I', data, ao + 4)[0]
+                          a_type = data[ao + 15]
+                          a_val = struct.unpack_from('<i', data, ao + 16)[0]
+
+                          if a_name == native_heap_idx and a_type == 0x12:
+                              struct.pack_into('<i', data, ao + 16, -1)
+                              print("✅ debuggable → true")
+                          if a_name == allow_backup_idx and a_type == 0x12 and a_val == 0:
+                              struct.pack_into('<i', data, ao + 16, -1)
+                              print("✅ allowBackup → true")
+
+                      # Sort attributes by ResID
+                      attr_blocks = []
+                      for ai in range(attr_count):
+                          ao = a_base + ai * attr_size
+                          block = bytes(data[ao:ao + attr_size])
+                          name_idx = struct.unpack_from('<I', block, 4)[0]
+                          rid = rid_table.get(name_idx, 0xFFFFFFFF)
+                          attr_blocks.append((rid, block))
+
+                      attr_blocks.sort(key=lambda x: x[0])
+
+                      for ai, (rid, block) in enumerate(attr_blocks):
+                          ao = a_base + ai * attr_size
+                          data[ao:ao + attr_size] = block
+
+                      print(f"✅ {attr_count} 个属性已排序")
+
+              pos += c_size
+
+          with open("work/AndroidManifest.xml", "wb") as f:
+              f.write(data)
+
+          print(f"🎉 Manifest 修改完成")
+          PYEOF
+
+      - name: 组装最终 APK
+        run: |
+          cp official.apk capcut_v16.9_v10.apk
+          zip -d capcut_v16.9_v10.apk "META-INF/*" 2>/dev/null || true
+
+          # 替换 Manifest
+          cd work
+          zip -0 ../capcut_v16.9_v10.apk AndroidManifest.xml
+          cd ..
+
+          # 替换 patched DEX
+          if [ -f patched_dex/classes7.dex ]; then
+            cd patched_dex
+            zip -0 ../capcut_v16.9_v10.apk classes7.dex
+            cd ..
+            echo "✅ classes7.dex 已替换"
+          else
+            echo "❌ 没有 patched DEX"
+            exit 1
+          fi
+
+          ls -la capcut_v16.9_v10.apk
+
+      - name: 对齐 + 签名
+        run: |
+          ZIPALIGN=$(find "$ANDROID_HOME" -name zipalign -type f | sort -V | tail -1)
+          APKSIGNER=$(find "$ANDROID_HOME" -name apksigner -type f | sort -V | tail -1)
+
+          KS_PASS="$(printf '%s' "${{ secrets.ANDROID_KEYSTORE_PASS }}" | tr -d '\r\n')"
+          ALIAS="$(printf '%s' "${{ secrets.ANDROID_KEY_ALIAS }}" | tr -d '\r\n ')"
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > release.jks
+
+          "$ZIPALIGN" -p -f 4 capcut_v16.9_v10.apk aligned.apk
+
+          "$APKSIGNER" sign \
+            --ks release.jks \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            --key-pass pass:"$KS_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --min-sdk-version 23 \
+            --out capcut_v16.9_v10_signed.apk \
+            aligned.apk
+
+          echo "=== 签名验证 ==="
+          "$APKSIGNER" verify -v capcut_v16.9_v10_signed.apk | head -10
+
+          echo ""
+          echo "=== aapt 验证 ==="
+          AAPT=$(find "$ANDROID_HOME" -name "aapt" -not -name "aapt2" -type f | sort -V | tail -1)
+          "$AAPT" dump badging capcut_v16.9_v10_signed.apk 2>&1 | grep -iE "debuggable|package:"
+
+          ls -la capcut_v16.9_v10_signed.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: capcut-v16.9-v10-cracking-bypass
+          path: capcut_v16.9_v10_signed.apk
+          retention-days: 7
