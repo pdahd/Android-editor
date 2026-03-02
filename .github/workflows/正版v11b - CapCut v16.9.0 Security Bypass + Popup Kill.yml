@@ -231,7 +231,10 @@ jobs:
               ".method public final onCreate(Landroid/os/Bundle;)V",
               "    .locals 0",
               "",
-              "    # PATCHED v11b: immediately kill security popup Activity",
+              "    # Must call super.onCreate() to satisfy Android framework",
+              "    invoke-super {p0, p1}, Lcom/vega/main/LynxActivity;->onCreate(Landroid/os/Bundle;)V",
+              "",
+              "    # PATCHED v11b: immediately finish to prevent popup display",
               "    invoke-virtual {p0}, Landroid/app/Activity;->finish()V",
               "    return-void",
               ".end method",
@@ -239,7 +242,7 @@ jobs:
 
           if pat:
               content = content[:pat.start()] + new_oncreate + content[pat.end():]
-              print("OK TransLynxActivity.onCreate() -> finish()")
+              print("OK TransLynxActivity.onCreate() -> super + finish()")
           else:
               print("FAIL onCreate() not found!")
               sys.exit(1)
