@@ -1,4 +1,4 @@
-name: v16.9.0-v10
+name: v16.9.0 CrackingInterceptor补丁+Manifest修改 v10
 
 on:
   workflow_dispatch:
