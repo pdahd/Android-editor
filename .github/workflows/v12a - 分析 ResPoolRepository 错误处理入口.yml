@@ -1,0 +1,210 @@
+name: v12a - 分析 ResPoolRepository 错误处理入口
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile DEX (skip resources)
+        run: |
+          java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. ResPoolRepository 完整代码"
+        run: |
+          {
+            echo "========== 搜索 ResPoolRepository =========="
+            find decoded/ -name "ResPoolRepository.smali" -type f 2>/dev/null
+
+            echo ""
+            echo "========== ResPoolRepository 完整代码 =========="
+            for f in $(find decoded/ -name "ResPoolRepository.smali" -type f 2>/dev/null); do
+              echo "--- FILE: $f ($(wc -l < "$f") lines) ---"
+              cat "$f"
+              echo ""
+            done
+
+            echo ""
+            echo "========== ResPoolRepository 内部类 =========="
+            for f in $(find decoded/ -name "ResPoolRepository\$*.smali" -type f 2>/dev/null); do
+              echo "--- FILE: $f ($(wc -l < "$f") lines) ---"
+              head -80 "$f"
+              echo "..."
+              echo ""
+            done
+          } 2>&1 | tee logs/01_ResPoolRepository.txt
+
+      - name: "2. 搜索 getArtistsPanelInfo 和错误处理"
+        run: |
+          {
+            echo "========== getArtistsPanelInfo 引用 =========="
+            rg -n "getArtistsPanelInfo" decoded/ 2>/dev/null | head -40
+
+            echo ""
+            echo "========== shark block 字符串引用 =========="
+            rg -n -B3 -A3 "shark" decoded/ 2>/dev/null | head -100
+
+            echo ""
+            echo "========== error_code.*-5 处理 =========="
+            rg -n "error_code" decoded/ 2>/dev/null | head -30
+
+            echo ""
+            echo "========== Too many people 提示文案 =========="
+            rg -rn "Too many people\|too_many\|try.again.later\|network.*busy\|rate.limit" decoded/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/02_error_handling.txt
+
+      - name: "3. SubtitleTemplateViewModel 和 Repository"
+        run: |
+          {
+            echo "========== SubtitleTemplate 相关类 =========="
+            find decoded/ -iname "*SubtitleTemplate*" -name "*.smali" -type f 2>/dev/null | head -20
+
+            echo ""
+            for f in $(find decoded/ -iname "*SubtitleTemplateEffectRepository*" -name "*.smali" -type f 2>/dev/null); do
+              echo "--- FILE: $f ($(wc -l < "$f") lines) ---"
+              head -120 "$f"
+              echo "..."
+              echo ""
+            done
+
+            echo ""
+            echo "========== EffectPanelViewModel 相关类 =========="
+            find decoded/ -iname "*EffectPanel*" -name "*.smali" -type f 2>/dev/null | head -20
+            find decoded/ -iname "*FontPanel*" -name "*.smali" -type f 2>/dev/null | head -20
+            find decoded/ -iname "*BubblePanel*" -name "*.smali" -type f 2>/dev/null | head -20
+            find decoded/ -iname "*AnimationPanel*" -name "*.smali" -type f 2>/dev/null | head -20
+          } 2>&1 | tee logs/03_viewmodel_repository.txt
+
+      - name: "4. ResPool SDK 的 JNI 回调接口"
+        run: |
+          {
+            echo "========== ResourceManager 相关 =========="
+            find decoded/ -iname "*ResourceManager*" -name "*.smali" -type f 2>/dev/null | head -20
+
+            echo ""
+            echo "========== IResPool 接口 =========="
+            find decoded/ -iname "*IResPool*" -name "*.smali" -type f 2>/dev/null | head -20
+
+            echo ""
+            echo "========== ResPool 回调接口 =========="
+            rg -l "onFailed\|onSuccess\|onResult" decoded/ 2>/dev/null | grep -i "respool\|artist\|panel" | head -20
+
+            echo ""
+            echo "========== ArtistPanelInfo 相关 Java 类 =========="
+            find decoded/ -iname "*ArtistPanelInfo*" -name "*.smali" -type f 2>/dev/null | head -20
+            for f in $(find decoded/ -iname "*ArtistPanelInfo*" -name "*.smali" -type f 2>/dev/null); do
+              echo "--- FILE: $f ($(wc -l < "$f") lines) ---"
+              head -60 "$f"
+              echo "..."
+              echo ""
+            done
+          } 2>&1 | tee logs/04_respool_jni_callback.txt
+
+      - name: "5. effectchannel 缓存读写逻辑"
+        run: |
+          {
+            echo "========== effectchannel 字符串引用 =========="
+            rg -n "effectchannel" decoded/ 2>/dev/null | head -30
+
+            echo ""
+            echo "========== panel_info 缓存 =========="
+            rg -n "panel_info\|panelInfo\|PanelInfo" decoded/ 2>/dev/null | grep -i "cache\|save\|load\|read\|write\|file" | head -30
+
+            echo ""
+            echo "========== effectchannelfontsonline 引用 =========="
+            rg -n "effectchannelfontsonline\|effectchannelemoji\|effectchannelsplit" decoded/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== ResPool 缓存路径构建 =========="
+            rg -n "effectchannel\|effect_version\|files/effect" decoded/ 2>/dev/null | head -30
+          } 2>&1 | tee logs/05_cache_logic.txt
+
+      - name: "6. F 方法 (ResPoolRepository 核心调度)"
+        run: |
+          {
+            echo "========== ResPoolRepository.F 方法搜索 =========="
+            rg -n "ResPoolRepository;->F\b" decoded/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== ResPoolRepository 中 panel 相关方法 =========="
+            f=$(find decoded/ -name "ResPoolRepository.smali" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              grep -n "\.method\|panel\|artist\|error\|fail\|success\|cache\|channel" "$f" | head -60
+            fi
+          } 2>&1 | tee logs/06_respool_F_method.txt
+
+      - name: "7. 面板名称映射"
+        run: |
+          {
+            echo "========== 搜索面板名称字符串 =========="
+            rg -n '"subtitle-templates"\|"flower"\|"bubble"\|"text"\|"system-fonts"\|"split-screen"' decoded/ 2>/dev/null | head -40
+
+            echo ""
+            echo "========== 面板注册/配置 =========="
+            rg -n "panel.*register\|registerPanel\|panelName\|panel_name" decoded/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== EffectPlatform 配置 =========="
+            find decoded/ -iname "*EffectPlatform*" -name "*.smali" -type f 2>/dev/null | head -10
+          } 2>&1 | tee logs/07_panel_names.txt
+
+      - name: "8. 汇总"
+        run: |
+          {
+            echo "================================================"
+            echo "  v12a 分析汇总"
+            echo "================================================"
+
+            echo ""
+            echo "=== ResPoolRepository 文件位置 ==="
+            find decoded/ -name "ResPoolRepository*.smali" -type f 2>/dev/null
+
+            echo ""
+            echo "=== 面板相关 ViewModel/Repository 数量 ==="
+            find decoded/ -iname "*Template*Repository*" -o -iname "*Template*ViewModel*" 2>/dev/null | grep "\.smali$" | head -10
+
+            echo ""
+            echo "=== ArtistPanelInfo 相关文件 ==="
+            find decoded/ -iname "*ArtistPanelInfo*" -name "*.smali" -type f 2>/dev/null
+
+            echo ""
+            echo "=== 各日志文件大小 ==="
+            ls -la logs/
+          } 2>&1 | tee logs/08_summary.txt
+
+      - name: Upload analysis results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v12a-respool-analysis
+          path: logs/
+          retention-days: 7
