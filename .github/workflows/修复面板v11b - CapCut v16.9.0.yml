@@ -1,0 +1,479 @@
+name: 修复面板v11b - CapCut v16.9.0 Security Bypass + Popup Kill
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+          ls -la official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile DEX (skip resources)
+        run: |
+          java -jar apktool.jar d -f -r official.apk -o smali_work > /dev/null 2>&1 || true
+          echo "smali directories: $(ls -d smali_work/smali_classes* 2>/dev/null | wc -l)"
+
+      - name: "Patch 1: vega CrackingInterceptor (skip-all + neutralize b, keep native)"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          patched_count = 0
+
+          # === 1a: VERIFY intercept() is native — DO NOT TOUCH ===
+          if re.search(r'\.method public final native intercept\(', content):
+              print("OK intercept() is native -- NOT touching it (v11b lesson learned)")
+          else:
+              print("FAIL intercept() is NOT native! Unexpected state!")
+              sys.exit(1)
+
+          # === 1b: VERIFY c(String)V is native — DO NOT TOUCH ===
+          if re.search(r'\.method public final native c\(Ljava/lang/String;\)V', content):
+              print("OK c(String)V is native -- NOT touching it (v10 lesson learned)")
+          else:
+              print("FAIL c(String)V is NOT native! Unexpected state!")
+              sys.exit(1)
+
+          # === 1c: a(String)Z -> always return true (skip ALL paths) ===
+          pat_a = re.search(
+              r'\.method public final a\(Ljava/lang/String;\)Z'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_a = "\n".join([
+              ".method public final a(Ljava/lang/String;)Z",
+              "    .locals 1",
+              "",
+              "    # PATCHED v11c: force ALL URLs into skip list",
+              "    # native intercept() calls this to check if URL should bypass checks",
+              "    # returning true = skip cracking check for this URL",
+              "    const/4 v0, 0x1",
+              "    return v0",
+              ".end method",
+          ])
+
+          if pat_a:
+              content = content[:pat_a.start()] + new_a + content[pat_a.end():]
+              print("OK a(String)Z -> always return true (skip all cracking checks)")
+              patched_count += 1
+          else:
+              print("FAIL a(String)Z not found!")
+              sys.exit(1)
+
+          # === 1d: b(I)V -> return-void (block isCracking storage) ===
+          pat_b = re.search(
+              r'\.method public final b\(I\)V.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_b = "\n".join([
+              ".method public final b(I)V",
+              "    .locals 0",
+              "    # PATCHED v11c: block isCracking/updateTime/crackCode storage",
+              "    return-void",
+              ".end method",
+          ])
+
+          if pat_b:
+              content = content[:pat_b.start()] + new_b + content[pat_b.end():]
+              print("OK b(I)V -> return-void")
+              patched_count += 1
+          else:
+              print("WARN b(I)V not found")
+
+          with open(filepath, "w") as f:
+              f.write(content)
+
+          print(f"DONE vega CrackingInterceptor: {patched_count} patches applied")
+          print("     intercept() = native (untouched)")
+          print("     c(String)V  = native (untouched)")
+          print("     a(String)Z  = always true (skip all)")
+          print("     b(I)V       = return-void (no SP write)")
+          PYEOF
+
+      - name: "Patch 2: Kill showGlobalSecurityDialog -> return Unit"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor$showGlobalSecurityDialog$1.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat_invoke = re.search(
+              r'# virtual methods\s*'
+              r'\.method public final invoke\(\)Ljava/lang/Object;'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_invoke = "\n".join([
+              "# virtual methods",
+              ".method public final invoke()Ljava/lang/Object;",
+              "    .locals 1",
+              "",
+              "    # PATCHED v11b: never show security dialog popup",
+              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat_invoke:
+              content = content[:pat_invoke.start()] + new_invoke + content[pat_invoke.end():]
+              print("OK showGlobalSecurityDialog$1.invoke() -> return Unit")
+          else:
+              print("FAIL invoke() not found!")
+              sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 3: xt.retouch CrackingInterceptor -> pass-through"
+        run: |
+          TARGET="smali_work/smali_classes7/com/xt/retouch/applauncher/core/interceptor/CrackingInterceptor.smali"
+          if [ ! -f "$TARGET" ]; then
+            echo "WARN xt.retouch version not found, skipping"
+            exit 0
+          fi
+          python3 << 'PYEOF'
+          import re
+
+          filepath = "smali_work/smali_classes7/com/xt/retouch/applauncher/core/interceptor/CrackingInterceptor.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'# virtual methods\s*'
+              r'\.method public final intercept\('
+              r'Lcom/bytedance/retrofit2/intercept/Interceptor\$Chain;\)'
+              r'Lcom/bytedance/retrofit2/SsResponse;.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_code = "\n".join([
+              "# virtual methods",
+              ".method public final intercept(Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;)Lcom/bytedance/retrofit2/SsResponse;",
+              "    .locals 1",
+              "    .annotation system Ldalvik/annotation/Signature;",
+              "        value = {",
+              '            "(",',
+              '            "Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;",',
+              '            ")",',
+              '            "Lcom/bytedance/retrofit2/SsResponse<",',
+              '            "*>;"',
+              "        }",
+              "    .end annotation",
+              "",
+              "    # PATCHED v11b: bypass ret code checks, pass through",
+              "    invoke-interface {p1}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->request()Lcom/bytedance/retrofit2/client/Request;",
+              "    move-result-object v0",
+              "    invoke-interface {p1, v0}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->proceed(Lcom/bytedance/retrofit2/client/Request;)Lcom/bytedance/retrofit2/SsResponse;",
+              "    move-result-object v0",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_code + content[pat.end():]
+              print("OK xt.retouch intercept() -> pass-through")
+          else:
+              print("WARN xt.retouch intercept() not found")
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 4: Kill TransLynxActivity -> finish() on create"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes15/com/vega/main/TransLynxActivity.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'\.method public final onCreate\(Landroid/os/Bundle;\)V'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_oncreate = "\n".join([
+              ".method public final onCreate(Landroid/os/Bundle;)V",
+              "    .locals 0",
+              "",
+              "    # Must call super.onCreate() to satisfy Android framework",
+              "    invoke-super {p0, p1}, Lcom/vega/main/LynxActivity;->onCreate(Landroid/os/Bundle;)V",
+              "",
+              "    # PATCHED v11b: immediately finish to prevent popup display",
+              "    invoke-virtual {p0}, Landroid/app/Activity;->finish()V",
+              "    return-void",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_oncreate + content[pat.end():]
+              print("OK TransLynxActivity.onCreate() -> super + finish()")
+          else:
+              print("FAIL onCreate() not found!")
+              sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Recompile patched DEX files
+        run: |
+          java -jar apktool.jar b smali_work -o temp_dex.apk > /dev/null 2>&1 || true
+
+          if [ ! -f temp_dex.apk ]; then
+            echo "FAIL DEX recompilation failed!"
+            exit 1
+          fi
+
+          mkdir -p patched_dex
+          unzip -o temp_dex.apk classes7.dex classes15.dex -d patched_dex/ 2>/dev/null
+
+          echo "=== Patched DEX files ==="
+          ls -la patched_dex/
+
+          if [ ! -f patched_dex/classes7.dex ] || [ ! -f patched_dex/classes15.dex ]; then
+            echo "FAIL Required DEX files missing!"
+            exit 1
+          fi
+
+      - name: "Patch 5: Binary modify Manifest (debuggable + allowBackup + sort)"
+        run: |
+          mkdir -p work
+          unzip -o official.apk AndroidManifest.xml -d work/
+
+          python3 << 'PYEOF'
+          import struct, sys
+
+          RESID_DEBUGGABLE = 0x0101000f
+
+          with open("work/AndroidManifest.xml", "rb") as f:
+              data = bytearray(f.read())
+
+          print(f"File size: {len(data)} bytes")
+
+          SP = 8
+          sp_chunk_size = struct.unpack_from('<I', data, SP + 4)[0]
+          sp_str_count = struct.unpack_from('<I', data, SP + 8)[0]
+          sp_hdr_sz = struct.unpack_from('<H', data, SP + 2)[0]
+          sp_flags = struct.unpack_from('<I', data, SP + 16)[0]
+          sp_str_start = struct.unpack_from('<I', data, SP + 20)[0]
+          is_utf8 = bool(sp_flags & 0x100)
+
+          OFF_BASE = SP + sp_hdr_sz
+          STR_BASE = SP + sp_str_start
+
+          str_info = {}
+          for i in range(sp_str_count):
+              rel = struct.unpack_from('<I', data, OFF_BASE + i * 4)[0]
+              pos = STR_BASE + rel
+              try:
+                  p = pos
+                  cc = struct.unpack_from('<H', data, p)[0]; p += 2
+                  if cc & 0x8000:
+                      cc = ((cc & 0x7FFF) << 16) | struct.unpack_from('<H', data, p)[0]; p += 2
+                  s = data[p:p+cc*2].decode('utf-16-le')
+                  str_info[i] = (s, pos, p + cc * 2 + 2)
+              except:
+                  str_info[i] = ("<error>", pos, pos)
+
+          native_heap_idx = -1
+          allow_backup_idx = -1
+          for idx, (s, _, _) in str_info.items():
+              if s == "allowNativeHeapPointerTagging":
+                  native_heap_idx = idx
+              elif s == "allowBackup":
+                  allow_backup_idx = idx
+
+          if native_heap_idx < 0:
+              print("FAIL allowNativeHeapPointerTagging not found!")
+              sys.exit(1)
+
+          RID_START = SP + sp_chunk_size
+          rid_chunk_size = struct.unpack_from('<I', data, RID_START + 4)[0]
+          rid_count = (rid_chunk_size - 8) // 4
+
+          rid_table = {}
+          for i in range(rid_count):
+              rid = struct.unpack_from('<I', data, RID_START + 8 + i * 4)[0]
+              rid_table[i] = rid
+
+          if native_heap_idx < rid_count:
+              old_rid = rid_table[native_heap_idx]
+              struct.pack_into('<I', data, RID_START + 8 + native_heap_idx * 4, RESID_DEBUGGABLE)
+              rid_table[native_heap_idx] = RESID_DEBUGGABLE
+              print(f"OK ResID[{native_heap_idx}]: 0x{old_rid:08X} -> 0x{RESID_DEBUGGABLE:08X}")
+
+          s, start, end = str_info[native_heap_idx]
+          new_name = "debuggable"
+          wp = start
+          new_u = new_name.encode('utf-16-le')
+          struct.pack_into('<H', data, wp, len(new_name)); wp += 2
+          for j, b in enumerate(new_u):
+              data[wp + j] = b
+          wp += len(new_u)
+          struct.pack_into('<H', data, wp, 0); wp += 2
+          while wp < end:
+              data[wp] = 0; wp += 1
+          print(f"OK String: '{s}' -> '{new_name}'")
+
+          pos = RID_START + rid_chunk_size
+          app_found = False
+
+          while pos < len(data) - 8:
+              c_type = struct.unpack_from('<H', data, pos)[0]
+              c_size = struct.unpack_from('<I', data, pos + 4)[0]
+              if c_size < 8 or pos + c_size > len(data):
+                  break
+
+              if c_type == 0x0102:
+                  elem_name_idx = struct.unpack_from('<I', data, pos + 20)[0]
+                  attr_start_off = struct.unpack_from('<H', data, pos + 24)[0]
+                  attr_size = struct.unpack_from('<H', data, pos + 26)[0]
+                  attr_count = struct.unpack_from('<H', data, pos + 28)[0]
+                  if attr_size == 0:
+                      attr_size = 20
+
+                  elem_name_str = str_info.get(elem_name_idx, ("<?>",))[0]
+                  a_base = pos + 16 + attr_start_off
+
+                  if elem_name_str == "application":
+                      app_found = True
+
+                      for ai in range(attr_count):
+                          ao = a_base + ai * attr_size
+                          if ao + 20 > len(data):
+                              break
+                          a_name = struct.unpack_from('<I', data, ao + 4)[0]
+                          a_type = data[ao + 15]
+                          a_val = struct.unpack_from('<i', data, ao + 16)[0]
+
+                          if a_name == native_heap_idx and a_type == 0x12:
+                              struct.pack_into('<i', data, ao + 16, -1)
+                              print("OK debuggable -> true")
+                          if a_name == allow_backup_idx and a_type == 0x12 and a_val == 0:
+                              struct.pack_into('<i', data, ao + 16, -1)
+                              print("OK allowBackup -> true")
+
+                      attr_blocks = []
+                      for ai in range(attr_count):
+                          ao = a_base + ai * attr_size
+                          block = bytes(data[ao:ao + attr_size])
+                          name_idx = struct.unpack_from('<I', block, 4)[0]
+                          rid = rid_table.get(name_idx, 0xFFFFFFFF)
+                          attr_blocks.append((rid, block))
+
+                      attr_blocks.sort(key=lambda x: x[0])
+
+                      for ai, (rid, block) in enumerate(attr_blocks):
+                          ao = a_base + ai * attr_size
+                          data[ao:ao + attr_size] = block
+
+                      print(f"OK {attr_count} attributes sorted by ResID")
+
+              pos += c_size
+
+          if not app_found:
+              print("FAIL <application> not found!")
+              sys.exit(1)
+
+          with open("work/AndroidManifest.xml", "wb") as f:
+              f.write(data)
+          print("DONE Manifest modification complete")
+          PYEOF
+
+      - name: Assemble patched APK
+        run: |
+          cp official.apk capcut_v11b.apk
+          zip -d capcut_v11b.apk "META-INF/*" 2>/dev/null || true
+
+          cd work
+          zip -0 ../capcut_v11b.apk AndroidManifest.xml
+          cd ..
+
+          cd patched_dex
+          zip -0 ../capcut_v11b.apk classes7.dex
+          zip -0 ../capcut_v11b.apk classes15.dex
+          cd ..
+
+          echo "=== Patched APK ==="
+          ls -la capcut_v11b.apk
+
+      - name: Align and Sign APK
+        run: |
+          ZIPALIGN=$(find "$ANDROID_HOME" -name zipalign -type f | sort -V | tail -1)
+          APKSIGNER=$(find "$ANDROID_HOME" -name apksigner -type f | sort -V | tail -1)
+
+          KS_PASS="$(printf '%s' "${{ secrets.ANDROID_KEYSTORE_PASS }}" | tr -d '\r\n')"
+          ALIAS="$(printf '%s' "${{ secrets.ANDROID_KEY_ALIAS }}" | tr -d '\r\n ')"
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > release.jks
+
+          "$ZIPALIGN" -p -f 4 capcut_v11b.apk aligned.apk
+
+          "$APKSIGNER" sign \
+            --ks release.jks \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            --key-pass pass:"$KS_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --min-sdk-version 23 \
+            --out capcut_v11b_signed.apk \
+            aligned.apk
+
+          echo "=== Signature verification ==="
+          "$APKSIGNER" verify -v capcut_v11b_signed.apk | head -10
+
+          echo ""
+          echo "=== aapt verification ==="
+          AAPT=$(find "$ANDROID_HOME" -name "aapt" -not -name "aapt2" -type f | sort -V | tail -1)
+          "$AAPT" dump badging capcut_v11b_signed.apk 2>&1 | grep -iE "debuggable|package:"
+
+          ls -la capcut_v11b_signed.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: capcut-v16.9-v11b-security-bypass
+          path: capcut_v11b_signed.apk
+          retention-days: 7
