@@ -1,0 +1,243 @@
+name: v14c - Templates + Bubbles 深度分析（callback代码提取）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. getComposeEffectWithCategoryId$2 完整代码（Templates关键callback）"
+        run: |
+          {
+            echo "========== getComposeEffectWithCategoryId\$2 =========="
+            f="decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$getComposeEffectWithCategoryId\$2.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND at expected path"
+              find decoded/ -name "*getComposeEffectWithCategoryId*2.smali" -type f 2>/dev/null
+            fi
+
+            echo ""
+            echo "========== stateResponse\$1 =========="
+            f2="decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$getComposeEffectWithCategoryId\$2\$stateResponse\$1.smali"
+            if [ -f "$f2" ]; then
+              echo "File: $f2 ($(wc -l < "$f2") lines)"
+              cat "$f2"
+            else
+              echo "NOT FOUND"
+            fi
+
+            echo ""
+            echo "========== stateResponse\$2 =========="
+            f3="decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$getComposeEffectWithCategoryId\$2\$stateResponse\$2.smali"
+            if [ -f "$f3" ]; then
+              echo "File: $f3 ($(wc -l < "$f3") lines)"
+              cat "$f3"
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/01_compose_effect_callback.txt
+
+      - name: "2. getCategoriesByMultiPanelWithCategoryId$2 完整代码"
+        run: |
+          {
+            echo "========== getCategoriesByMultiPanelWithCategoryId\$2 =========="
+            f="decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$getCategoriesByMultiPanelWithCategoryId\$2.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND"
+              find decoded/ -name "*getCategoriesByMultiPanelWithCategoryId*" -name "*.smali" -type f 2>/dev/null
+            fi
+
+            echo ""
+            echo "========== getCategoriesByMultiPanelWithCategoryId\$2\$2\$1 =========="
+            for suffix in "2\$1" "2\$2"; do
+              fn="decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$getCategoriesByMultiPanelWithCategoryId\$2\$$suffix.smali"
+              if [ -f "$fn" ]; then
+                echo "--- $(basename "$fn") ($(wc -l < "$fn") lines) ---"
+                cat "$fn"
+                echo ""
+              fi
+            done
+          } 2>&1 | tee logs/02_categories_callback.txt
+
+      - name: "3. getComposeEffect$2 完整代码"
+        run: |
+          {
+            echo "========== getComposeEffect\$2 =========="
+            f="decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$getComposeEffect\$2.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/03_compose_effect_single.txt
+
+      - name: "4. SubtitleTemplateEffectRepository 核心方法代码（b/c/d/g 方法）"
+        run: |
+          {
+            f="decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository.smali"
+            if [ -f "$f" ]; then
+              echo "========== 方法 b (getComposeEffectWithCategoryId) =========="
+              awk '/^\.method public static b\(/,/^\.end method/' "$f" | head -120
+              
+              echo ""
+              echo "========== 方法 c (getCategoriesByMultiPanel?) =========="
+              awk '/^\.method public static c\(/,/^\.end method/' "$f" | head -120
+              
+              echo ""
+              echo "========== 方法 d =========="
+              awk '/^\.method public static d\(/,/^\.end method/' "$f" | head -120
+              
+              echo ""
+              echo "========== 方法 a (getCategoriesByMultiPanelWithCategoryId?) =========="
+              awk '/^\.method public final a\(/,/^\.end method/' "$f" | head -120
+            fi
+          } 2>&1 | tee logs/04_template_repo_methods.txt
+
+      - name: "5. TextBubbleResViewModel 完整代码（Bubble数据加载）"
+        run: |
+          {
+            echo "========== TextBubbleResViewModel =========="
+            f="decoded/smali_classes24/com/vega/libsticker/viewmodel/TextBubbleResViewModel.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND"
+              find decoded/ -iname "*TextBubbleRes*" -name "*.smali" -type f 2>/dev/null
+            fi
+
+            echo ""
+            echo "========== TextBubbleViewModel 方法列表 =========="
+            f2="decoded/smali_classes10/com/vega/libsticker/viewmodel/TextBubbleViewModel.smali"
+            if [ -f "$f2" ]; then
+              grep -n "\.method\|getCategories\|getEffect\|fetchEffect\|loadData\|panel\|bubble" "$f2" | head -40
+            fi
+
+            echo ""
+            echo "========== TextBubbleViewModel 内部类 =========="
+            find decoded/ -path "*TextBubbleViewModel\$*" -name "*.smali" -type f 2>/dev/null
+          } 2>&1 | tee logs/05_bubble_viewmodel.txt
+
+      - name: "6. ResourceRepository（SubtitleTemplate的父类依赖）"
+        run: |
+          {
+            echo "========== ResourceRepository 方法列表 =========="
+            f="decoded/smali_classes7/com/vega/libeffect/repository/ResourceRepository.smali"
+            if [ -f "$f" ]; then
+              grep -n "\.method\|getCateogr\|getEffect\|getCompose\|getPanel\|fetchPanel\|callback" "$f" | head -50
+            else
+              find decoded/ -name "ResourceRepository.smali" -type f 2>/dev/null
+            fi
+
+            echo ""
+            echo "========== ResourceRepository 内部 callback 类 =========="
+            find decoded/ -path "*ResourceRepository\$*callback*" -name "*.smali" -type f 2>/dev/null | head -20
+            find decoded/ -path "*ResourceRepository\$*Callback*" -name "*.smali" -type f 2>/dev/null | head -20
+          } 2>&1 | tee logs/06_resource_repository.txt
+
+      - name: "7. 追踪 getComposeEffectWithCategoryId 调用了哪些 ResPool 方法"
+        run: |
+          {
+            echo "========== getComposeEffectWithCategoryId\$2 中的 ResPool 调用 =========="
+            rg -n "ResPoolRepository\|getArtists\|resPool\|ResourcePool" \
+              "decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$getComposeEffectWithCategoryId\$2.smali" 2>/dev/null
+
+            echo ""
+            echo "========== 所有 SubtitleTemplate callback 中的 ResPool 调用 =========="
+            for f in decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$*.smali; do
+              hits=$(rg -c "ResPoolRepository\|getArtists" "$f" 2>/dev/null || echo "0")
+              if [ "$hits" != "0" ]; then
+                echo "--- $(basename "$f"): $hits hits ---"
+                rg -n "ResPoolRepository\|getArtists" "$f" 2>/dev/null
+                echo ""
+              fi
+            done
+
+            echo ""
+            echo "========== 搜索 stateResponse 的错误处理逻辑 =========="
+            for f in decoded/smali_classes7/com/vega/libeffect/repository/SubtitleTemplateEffectRepository\$*stateResponse*.smali; do
+              if [ -f "$f" ]; then
+                echo "--- $(basename "$f") ($(wc -l < "$f") lines) ---"
+                rg -n "error\|Error\|fail\|Triple\|resumeWith\|callback" "$f" 2>/dev/null
+                echo ""
+              fi
+            done
+          } 2>&1 | tee logs/07_respool_calls_trace.txt
+
+      - name: "8. 'Too many people' 错误的UI显示路径"
+        run: |
+          {
+            echo "========== SubtitleTemplateEntrance 中的错误状态处理 =========="
+            f="decoded/smali_classes10/com/vega/libsticker/subtitle/view/SubtitleTemplateEntrance.smali"
+            if [ -f "$f" ]; then
+              rg -n "TemplateLoadState\|showError\|showEmpty\|loadState\|Too many\|retry\|FAILED\|ERROR\|LOADING" "$f" 2>/dev/null | head -30
+            fi
+
+            echo ""
+            echo "========== TemplateLoadState 枚举/类 =========="
+            f2="decoded/smali_classes10/com/vega/libsticker/subtitle/view/SubtitleTemplateEntrance\$TemplateLoadState.smali"
+            if [ -f "$f2" ]; then
+              cat "$f2"
+            fi
+
+            echo ""
+            echo "========== TextTemplatePanel 相关类 =========="
+            find decoded/ -iname "*TextTemplatePanel*" -name "*.smali" -type f 2>/dev/null | head -10
+            for f in $(find decoded/ -iname "*TextTemplatePanel*" -name "*.smali" -not -name "*\$*" -type f 2>/dev/null | head -3); do
+              echo "--- $f ---"
+              grep -n "\.method\|error\|loadState\|categories\|Too many" "$f" | head -20
+              echo ""
+            done
+
+            echo ""
+            echo "========== Bubble 面板的错误处理 =========="
+            find decoded/ -iname "*BubblePanel*" -o -iname "*BubblePager*" 2>/dev/null | grep "\.smali$" | head -10
+            rg -rn "bubble.*error\|bubble.*fail\|bubble.*load" decoded/smali_classes*/com/vega/libsticker/ 2>/dev/null | head -15
+          } 2>&1 | tee logs/08_error_ui_path.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v14c-deep-template-bubble-analysis
+          path: logs/
+          retention-days: 7
