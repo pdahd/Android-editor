@@ -1,0 +1,230 @@
+name: v15c - 分析分辨率 2K/4K Pro 锁定逻辑
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. 导出设置 ViewModel（分辨率控制核心）"
+        run: |
+          {
+            echo "========== ExportViewModel 方法列表 =========="
+            f="decoded/smali_classes7/com/vega/export/edit/viewmodel/ExportViewModel.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              grep -n "\.method\|resolution\|quality\|1080\|2k\|4k\|2160\|1440\|720\|vip\|pro\|check\|slider\|seek\|snap\|revert\|paywall\|subscribe\|benefit\|trial" "$f" | head -60
+            fi
+
+            echo ""
+            echo "========== ExportViewModelV2 方法列表 =========="
+            f2="decoded/smali_classes7/com/vega/export/edit/viewmodel/export_refactor/ExportViewModelV2.smali"
+            if [ -f "$f2" ]; then
+              echo "File: $f2 ($(wc -l < "$f2") lines)"
+              grep -n "\.method\|resolution\|quality\|1080\|2k\|4k\|vip\|pro\|check\|slider\|paywall\|subscribe\|benefit" "$f2" | head -60
+            fi
+
+            echo ""
+            echo "========== BaseExportViewModel 方法列表 =========="
+            f3="decoded/smali_classes3/com/vega/export/base/BaseExportViewModel.smali"
+            if [ -f "$f3" ]; then
+              echo "File: $f3 ($(wc -l < "$f3") lines)"
+              grep -n "\.method\|resolution\|quality\|vip\|pro\|check\|watermark\|subscribe\|benefit\|BusinessFunction" "$f3" | head -60
+            fi
+          } 2>&1 | tee logs/01_export_viewmodel.txt
+
+      - name: "2. 分辨率/画质相关类搜索"
+        run: |
+          {
+            echo "========== Resolution 相关类 =========="
+            find decoded/ -iname "*Resolution*" -name "*.smali" -type f 2>/dev/null | grep -v "\$" | sort | head -20
+
+            echo ""
+            echo "========== Quality 相关类 =========="
+            find decoded/ -iname "*Quality*" -name "*.smali" -type f 2>/dev/null | grep -iv "audio\|sound\|image" | grep -v "\$" | sort | head -20
+
+            echo ""
+            echo "========== 分辨率字符串搜索 =========="
+            rg -n '"1080"\|"2k"\|"4k"\|"2160"\|"1440"\|"resolution"\|"max_resolution"\|"export_resolution"\|"hd_resolution"' decoded/smali_classes*/com/vega/export/ 2>/dev/null | head -20
+            rg -n '"1080"\|"2k"\|"4k"\|"2160"\|"1440"\|"resolution"' decoded/smali_classes*/com/vega/subscription/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== ExportQuality 枚举/类 =========="
+            find decoded/ -iname "*ExportQuality*" -o -iname "*VideoQuality*" -o -iname "*QualityConfig*" 2>/dev/null | grep "\.smali$" | head -15
+          } 2>&1 | tee logs/02_resolution_classes.txt
+
+      - name: "3. VipExportChecker 完整方法列表"
+        run: |
+          {
+            echo "========== VipExportChecker 方法列表 =========="
+            f="decoded/smali_classes8/com/vega/subscription/biz/checker/VipExportChecker.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              grep -n "\.method\|\.field\|resolution\|quality\|1080\|2k\|4k\|check\|verify\|benefit\|trial\|vip\|subscribe" "$f" | head -40
+            fi
+
+            echo ""
+            echo "========== RadicalVipExportChecker 方法列表 =========="
+            f2="decoded/smali_classes8/com/vega/subscription/biz/checker/RadicalVipExportChecker.smali"
+            if [ -f "$f2" ]; then
+              echo "File: $f2 ($(wc -l < "$f2") lines)"
+              grep -n "\.method\|\.field\|resolution\|quality\|check\|benefit\|trial\|export" "$f2" | head -40
+            fi
+
+            echo ""
+            echo "========== VipExportChecker 内部类 =========="
+            find decoded/ -path "*VipExportChecker\$*" -name "*.smali" -type f 2>/dev/null | head -10
+            find decoded/ -path "*RadicalVipExportChecker\$*" -name "*.smali" -type f 2>/dev/null | head -10
+          } 2>&1 | tee logs/03_export_checker.txt
+
+      - name: "4. 导出设置 UI 层（滑块控制）"
+        run: |
+          {
+            echo "========== ExportSettingPanel / ExportMainPanel =========="
+            find decoded/ -iname "*ExportMainPanel*" -o -iname "*ExportSettingPanel*" -o -iname "*ExportConfigPanel*" 2>/dev/null | grep "\.smali$" | grep -v "\$" | head -10
+            for f in $(find decoded/ -iname "*ExportMainPanel*" -o -iname "*ExportSettingPanel*" -o -iname "*ExportConfigPanel*" 2>/dev/null | grep "\.smali$" | grep -v "\$" | head -5); do
+              echo "--- $f ---"
+              grep -n "\.method\|resolution\|slider\|seek\|progress\|quality\|1080\|2k\|4k\|snap\|revert\|reset\|vip\|pro\|diamond\|lock" "$f" | head -30
+              echo ""
+            done
+
+            echo ""
+            echo "========== BaseOriginExportMainPanel =========="
+            f="decoded/smali_classes3/com/vega/export/edit/view/BaseOriginExportMainPanel.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              grep -n "\.method\|resolution\|slider\|seek\|quality\|1080\|2k\|4k\|snap\|revert\|vip\|pro\|lock\|check" "$f" | head -40
+            fi
+          } 2>&1 | tee logs/04_export_ui.txt
+
+      - name: "5. SubscriptionApi（在线校验接口）"
+        run: |
+          {
+            echo "========== SubscribeApi 接口定义 =========="
+            find decoded/ -iname "*SubscribeApi*" -name "*.smali" -type f 2>/dev/null | grep -v "\$" | head -10
+            for f in $(find decoded/ -iname "SubscribeApi.smali" -type f 2>/dev/null | head -3); do
+              echo "--- $f ---"
+              grep -n "\.method\|check\|verify\|resolution\|quality\|benefit\|trial\|subscribe\|goods\|access" "$f" | head -30
+              echo ""
+            done
+
+            echo ""
+            echo "========== SubscriptionService 实现 =========="
+            find decoded/ -iname "*SubscriptionService*" -name "*.smali" -type f 2>/dev/null | grep -v "\$" | head -10
+
+            echo ""
+            echo "========== BusinessServiceImpl（包含 reportVipFeatureDetails）=========="
+            f="decoded/smali_classes8/com/vega/subscription/legacy/service/BusinessServiceImpl.smali"
+            if [ -f "$f" ]; then
+              grep -n "\.method\|check\|verify\|resolution\|quality\|benefit\|export\|vip\|subscribe" "$f" | head -30
+            fi
+          } 2>&1 | tee logs/05_subscription_api.txt
+
+      - name: "6. BusinessFunction 体系（分辨率专用？）"
+        run: |
+          {
+            echo "========== 所有 BusinessFunction 子类 =========="
+            find decoded/ -path "*subscription/biz/function/*" -name "*.smali" -type f 2>/dev/null | grep -v "\$" | sort
+
+            echo ""
+            echo "========== Resolution/Quality BusinessFunction =========="
+            find decoded/ -iname "*Resolution*Business*" -o -iname "*Quality*Business*" -o -iname "*Export*Business*" 2>/dev/null | grep "\.smali$" | head -10
+
+            echo ""
+            echo "========== HDBusinessFunction / UHDBusinessFunction =========="
+            find decoded/ -iname "*HD*Business*" -o -iname "*UHD*Business*" -o -iname "*HighRes*Business*" 2>/dev/null | grep "\.smali$" | head -10
+          } 2>&1 | tee logs/06_business_functions.txt
+
+      - name: "7. 导出分辨率配置和限制"
+        run: |
+          {
+            echo "========== 分辨率数值在导出代码中的引用 =========="
+            rg -n "0x780\|0x870\|0x5a0\|0x438\|1920\|2560\|3840\|1080\|1440\|2160" decoded/smali_classes*/com/vega/export/ 2>/dev/null | head -30
+
+            echo ""
+            echo "========== ExportConfig 中的分辨率相关 =========="
+            rg -rn "resolution\|maxWidth\|maxHeight\|max_resolution\|export_quality\|quality_level" decoded/smali_classes*/com/vega/export/ 2>/dev/null | head -30
+
+            echo ""
+            echo "========== Lemon ExportConfig 分辨率 =========="
+            rg -rn "resolution\|maxWidth\|maxHeight\|1080\|1440\|2160\|2560\|3840" decoded/smali_classes*/com/lemon/editexport/ 2>/dev/null | head -20
+            rg -rn "resolution\|maxWidth\|maxHeight\|1080\|1440\|2160" decoded/smali_classes*/com/lemon/lv/config/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/07_resolution_config.txt
+
+      - name: "8. Checker 体系（BaseBusinessChecker 及其子类）"
+        run: |
+          {
+            echo "========== BaseBusinessChecker 方法列表 =========="
+            f=$(find decoded/ -name "BaseBusinessChecker.smali" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              grep -n "\.method\|check\|verify\|rescue\|result" "$f" | head -20
+              echo ""
+              echo "--- 完整代码 ---"
+              cat "$f"
+            fi
+
+            echo ""
+            echo "========== CheckResult 类 =========="
+            f2=$(find decoded/ -name "CheckResult.smali" -path "*/subscription/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f2" ]; then
+              echo "File: $f2 ($(wc -l < "$f2") lines)"
+              cat "$f2"
+            fi
+
+            echo ""
+            echo "========== RescueStatus 类 =========="
+            f3=$(find decoded/ -name "RescueStatus.smali" -type f 2>/dev/null | head -1)
+            if [ -n "$f3" ]; then
+              echo "File: $f3 ($(wc -l < "$f3") lines)"
+              cat "$f3"
+            fi
+
+            echo ""
+            echo "========== CheckerContext 类 =========="
+            f4=$(find decoded/ -name "CheckerContext.smali" -path "*/subscription/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f4" ]; then
+              echo "File: $f4 ($(wc -l < "$f4") lines)"
+              cat "$f4"
+            fi
+          } 2>&1 | tee logs/08_checker_system.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v15c-resolution-analysis
+          path: logs/
+          retention-days: 7
