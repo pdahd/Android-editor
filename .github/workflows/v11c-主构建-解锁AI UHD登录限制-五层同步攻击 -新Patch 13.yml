@@ -1,4 +1,4 @@
-name: v11c-主构建-解锁AI UHD登录限制-枚举破解 + 去掉Patch 13
+name: v11c-主构建-解锁AI UHD登录限制-五层同步攻击-新Patch 13
 
 on:
   workflow_dispatch:
@@ -665,45 +665,132 @@ jobs:
               f.write(content)
           PYEOF
 
-      - name: "Patch 14: AttachmentVipFeature.l() -> VipStatusUnknown (bypass VIP feature gate)"
+      - name: "Patch 13: Multi-layer VIP Export & Feature Bypass (AI UHD + all Pro)"
         run: |
           python3 << 'PYEOF'
           import re, sys
 
-          filepath = "smali_work/smali_classes8/com/vega/middlebridge/swig/AttachmentVipFeature.smali"
-          with open(filepath, "r") as f:
+          patched = 0
+
+          # === 13a: BaseVipExportBusinessFunction — H1 and X2 ===
+          fp = "smali_work/smali_classes8/com/vega/subscription/biz/function/base/BaseVipExportBusinessFunction.smali"
+          with open(fp, "r") as f:
               content = f.read()
 
+          # H1(Z)Z → return false
+          pat = re.search(r'\.method public final H1\(Z\)Z.*?\.end method', content, re.DOTALL)
+          if pat:
+              new = "\n".join([
+                  ".method public final H1(Z)Z",
+                  "    .locals 1",
+                  "    # PATCHED: no VIP features require payment for export",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK BaseVipExport.H1(Z)Z -> false")
+              patched += 1
+          else:
+              print("FAIL H1 not found"); sys.exit(1)
+
+          # X2()Z → return false
+          pat = re.search(r'\.method public final X2\(\)Z.*?\.end method', content, re.DOTALL)
+          if pat:
+              new = "\n".join([
+                  ".method public final X2()Z",
+                  "    .locals 1",
+                  "    # PATCHED: alt VIP check passes",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK BaseVipExport.X2()Z -> false")
+              patched += 1
+          else:
+              print("FAIL X2 not found"); sys.exit(1)
+
+          with open(fp, "w") as f:
+              f.write(content)
+
+          # === 13b: VipExportBusinessFunction.p4(I)V → return void ===
+          fp = "smali_work/smali_classes8/com/vega/subscription/biz/function/VipExportBusinessFunction.smali"
+          with open(fp, "r") as f:
+              content = f.read()
+
+          pat = re.search(r'\.method public final p4\(I\)V.*?\.end method', content, re.DOTALL)
+          if pat:
+              new = "\n".join([
+                  ".method public final p4(I)V",
+                  "    .locals 0",
+                  "    # PATCHED: suppress VIP dialog on feature count change",
+                  "    return-void",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK VipExportBusiness.p4(I)V -> void")
+              patched += 1
+          else:
+              print("WARN p4 not found")
+
+          with open(fp, "w") as f:
+              f.write(content)
+
+          # === 13c: VipStatusExtKt — c() and d() ===
+          fp = "smali_work/smali_classes8/com/vega/subscriptionapi/ext/VipStatusExtKt.smali"
+          with open(fp, "r") as f:
+              content = f.read()
+
+          # c() → return false (isPay → never)
           pat = re.search(
-              r'\.method public final l\(\)Lcom/vega/middlebridge/swig/LVVEVipStatus;'
-              r'.*?\.end method',
+              r'\.method public static final c\(Lcom/vega/middlebridge/swig/LVVEVipStatus;\)Z.*?\.end method',
               content, re.DOTALL
           )
-
-          new_method = "\n".join([
-              ".method public final l()Lcom/vega/middlebridge/swig/LVVEVipStatus;",
-              "    .locals 1",
-              "",
-              "    # PATCHED: always return VipStatusUnknown (value=0, field b)",
-              "    # Original: JNI call -> AttachmentVipFeatureModuleJNI.getVipStatus -> int -> enum",
-              "    # Effect: ALL VIP features appear as 'unknown/free' to Java layer",
-              "    # NLE C++ engine still processes features normally (AI UHD rendering unaffected)",
-              "    sget-object v0, Lcom/vega/middlebridge/swig/LVVEVipStatus;->b:Lcom/vega/middlebridge/swig/LVVEVipStatus;",
-              "    return-object v0",
-              ".end method",
-          ])
-
           if pat:
-              content = content[:pat.start()] + new_method + content[pat.end():]
-              print("OK AttachmentVipFeature.l() -> VipStatusUnknown")
+              new = "\n".join([
+                  ".method public static final c(Lcom/vega/middlebridge/swig/LVVEVipStatus;)Z",
+                  "    .locals 1",
+                  "    # PATCHED: isPay -> always false (all features appear free)",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK VipStatusExtKt.c() -> false (isPay)")
+              patched += 1
           else:
-              print("FAIL l() not found!")
-              sys.exit(1)
+              print("FAIL c() not found"); sys.exit(1)
 
-          with open(filepath, "w") as f:
+          # d() → return false (isSVip → never)
+          pat = re.search(
+              r'\.method public static final d\(Lcom/vega/middlebridge/swig/LVVEVipStatus;\)Z.*?\.end method',
+              content, re.DOTALL
+          )
+          if pat:
+              new = "\n".join([
+                  ".method public static final d(Lcom/vega/middlebridge/swig/LVVEVipStatus;)Z",
+                  "    .locals 1",
+                  "    # PATCHED: isSVip -> always false",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK VipStatusExtKt.d() -> false (isSVip)")
+              patched += 1
+          else:
+              print("FAIL d() not found"); sys.exit(1)
+
+          with open(fp, "w") as f:
               f.write(content)
-          PYEOF
 
+          print(f"\nTotal: {patched}/5 patches applied")
+          if patched < 4:
+              print("ERROR: Expected at least 4 patches")
+              sys.exit(1)
+          PYEOF
+          
       - name: Recompile patched DEX files
         run: |
           java -jar apktool.jar b smali_work -o temp_dex.apk > /dev/null 2>&1 || true
