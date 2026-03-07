@@ -1,4 +1,4 @@
-name: v11c-主构建-解锁AI UHD登录限制-枚举破解 + Patch 14
+name: v11c-主构建-解锁AI UHD登录限制-枚举破解 + 去掉Patch 13
 
 on:
   workflow_dispatch:
@@ -657,59 +657,6 @@ jobs:
           if pat:
               content = content[:pat.start()] + new_method + content[pat.end():]
               print("OK ResolutionBusinessFunction doUseFunction$1 -> smart bypass (free path preserved)")
-          else:
-              print("FAIL invokeSuspend not found!")
-              sys.exit(1)
-
-          with open(filepath, "w") as f:
-              f.write(content)
-          PYEOF
-
-      - name: "Patch 13: TemplateExportUltraHdBusinessFunction doUseFunction -> always succeed"
-        run: |
-          python3 << 'PYEOF'
-          import re, sys
-
-          filepath = "smali_work/smali_classes8/com/vega/subscription/biz/function/TemplateExportUltraHdBusinessFunction$doUseFunction$1.smali"
-          with open(filepath, "r") as f:
-              content = f.read()
-
-          pat = re.search(
-              r'\.method public final invokeSuspend\(Ljava/lang/Object;\)Ljava/lang/Object;'
-              r'.*?\.end method',
-              content, re.DOTALL
-          )
-
-          new_method = "\n".join([
-              ".method public final invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;",
-              "    .locals 4",
-              "",
-              "    # PATCHED: skip ExportTrialBenefitHelper + paywall, directly succeed",
-              "    invoke-static {p1}, Lkotlin/ResultKt;->throwOnFailure(Ljava/lang/Object;)V",
-              "",
-              "    # Get success callback (field s = Function1<Result, Unit>)",
-              "    iget-object v0, p0, Lcom/vega/subscription/biz/function/TemplateExportUltraHdBusinessFunction$doUseFunction$1;->s:Lkotlin/jvm/functions/Function1;",
-              "",
-              '    # Build Result.success("local verify success")',
-              "    sget-object v1, Lcom/vega/subscriptionapi/core/Result;->d:Lcom/vega/subscriptionapi/core/Result$Companion;",
-              "    const/4 v2, 0x0",
-              '    const-string v3, "local verify success"',
-              "    const/4 p1, 0x1",
-              "    invoke-static {v1, v2, v3, p1}, Lcom/vega/subscriptionapi/core/Result$Companion;->c(Lcom/vega/subscriptionapi/core/Result$Companion;Ljava/util/Map;Ljava/lang/String;I)Lcom/vega/subscriptionapi/core/Result;",
-              "    move-result-object v1",
-              "",
-              "    # Call callback with success result",
-              "    invoke-interface {v0, v1}, Lkotlin/jvm/functions/Function1;->invoke(Ljava/lang/Object;)Ljava/lang/Object;",
-              "",
-              "    # Return Unit",
-              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
-              "    return-object v0",
-              ".end method",
-          ])
-
-          if pat:
-              content = content[:pat.start()] + new_method + content[pat.end():]
-              print("OK TemplateExportUltraHdBusinessFunction doUseFunction$1 -> always succeed")
           else:
               print("FAIL invokeSuspend not found!")
               sys.exit(1)
