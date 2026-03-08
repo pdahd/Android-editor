@@ -575,6 +575,7 @@ jobs:
           PYEOF
 
       - name: "Patch 13: Multi-layer VIP Export & Feature Bypass (AI UHD + all Pro)"
+        if: false
         run: |
           python3 << 'PYEOF'
           import re, sys
