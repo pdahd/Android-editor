@@ -1,0 +1,953 @@
+name: 【构建】_v12a_AI UHD开关-Patch 14-ExportConfigPanel登录门控绕过_2026-03-08_15-31-47
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+          ls -la official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile DEX (skip resources)
+        run: |
+          java -jar apktool.jar d -f -r official.apk -o smali_work > /dev/null 2>&1 || true
+          echo "smali directories: $(ls -d smali_work/smali_classes* 2>/dev/null | wc -l)"
+
+      - name: "Patch 1: vega CrackingInterceptor (skip-all + neutralize b, keep native)"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          patched_count = 0
+
+          if re.search(r'\.method public final native intercept\(', content):
+              print("OK intercept() is native -- NOT touching it")
+          else:
+              print("FAIL intercept() is NOT native!"); sys.exit(1)
+
+          if re.search(r'\.method public final native c\(Ljava/lang/String;\)V', content):
+              print("OK c(String)V is native -- NOT touching it")
+          else:
+              print("FAIL c(String)V is NOT native!"); sys.exit(1)
+
+          pat_a = re.search(r'\.method public final a\(Ljava/lang/String;\)Z.*?\.end method', content, re.DOTALL)
+          new_a = "\n".join([
+              ".method public final a(Ljava/lang/String;)Z",
+              "    .locals 1",
+              "    # PATCHED: force ALL URLs into skip list",
+              "    const/4 v0, 0x1",
+              "    return v0",
+              ".end method",
+          ])
+          if pat_a:
+              content = content[:pat_a.start()] + new_a + content[pat_a.end():]
+              print("OK a(String)Z -> always return true")
+              patched_count += 1
+          else:
+              print("FAIL a(String)Z not found!"); sys.exit(1)
+
+          pat_b = re.search(r'\.method public final b\(I\)V.*?\.end method', content, re.DOTALL)
+          new_b = "\n".join([
+              ".method public final b(I)V",
+              "    .locals 0",
+              "    # PATCHED: block isCracking storage",
+              "    return-void",
+              ".end method",
+          ])
+          if pat_b:
+              content = content[:pat_b.start()] + new_b + content[pat_b.end():]
+              print("OK b(I)V -> return-void")
+              patched_count += 1
+          else:
+              print("WARN b(I)V not found")
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          print(f"DONE vega CrackingInterceptor: {patched_count} patches applied")
+          PYEOF
+
+      - name: "Patch 2: Kill showGlobalSecurityDialog -> return Unit"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor$showGlobalSecurityDialog$1.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat_invoke = re.search(
+              r'# virtual methods\s*'
+              r'\.method public final invoke\(\)Ljava/lang/Object;'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_invoke = "\n".join([
+              "# virtual methods",
+              ".method public final invoke()Ljava/lang/Object;",
+              "    .locals 1",
+              "    # PATCHED: never show security dialog popup",
+              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat_invoke:
+              content = content[:pat_invoke.start()] + new_invoke + content[pat_invoke.end():]
+              print("OK showGlobalSecurityDialog$1.invoke() -> return Unit")
+          else:
+              print("FAIL invoke() not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 3: xt.retouch CrackingInterceptor -> pass-through"
+        run: |
+          TARGET="smali_work/smali_classes7/com/xt/retouch/applauncher/core/interceptor/CrackingInterceptor.smali"
+          if [ ! -f "$TARGET" ]; then
+            echo "WARN xt.retouch version not found, skipping"
+            exit 0
+          fi
+          python3 << 'PYEOF'
+          import re
+
+          filepath = "smali_work/smali_classes7/com/xt/retouch/applauncher/core/interceptor/CrackingInterceptor.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'# virtual methods\s*'
+              r'\.method public final intercept\('
+              r'Lcom/bytedance/retrofit2/intercept/Interceptor\$Chain;\)'
+              r'Lcom/bytedance/retrofit2/SsResponse;.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_code = "\n".join([
+              "# virtual methods",
+              ".method public final intercept(Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;)Lcom/bytedance/retrofit2/SsResponse;",
+              "    .locals 1",
+              "    .annotation system Ldalvik/annotation/Signature;",
+              "        value = {",
+              '            "(",',
+              '            "Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;",',
+              '            ")",',
+              '            "Lcom/bytedance/retrofit2/SsResponse<",',
+              '            "*>;"',
+              "        }",
+              "    .end annotation",
+              "",
+              "    # PATCHED: bypass ret code checks, pass through",
+              "    invoke-interface {p1}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->request()Lcom/bytedance/retrofit2/client/Request;",
+              "    move-result-object v0",
+              "    invoke-interface {p1, v0}, Lcom/bytedance/retrofit2/intercept/Interceptor$Chain;->proceed(Lcom/bytedance/retrofit2/client/Request;)Lcom/bytedance/retrofit2/SsResponse;",
+              "    move-result-object v0",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_code + content[pat.end():]
+              print("OK xt.retouch intercept() -> pass-through")
+          else:
+              print("WARN xt.retouch intercept() not found")
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 4: Kill TransLynxActivity -> finish() on create"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes15/com/vega/main/TransLynxActivity.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'\.method public final onCreate\(Landroid/os/Bundle;\)V'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_oncreate = "\n".join([
+              ".method public final onCreate(Landroid/os/Bundle;)V",
+              "    .locals 0",
+              "    invoke-super {p0, p1}, Lcom/vega/main/LynxActivity;->onCreate(Landroid/os/Bundle;)V",
+              "    # PATCHED: immediately finish to prevent popup display",
+              "    invoke-virtual {p0}, Landroid/app/Activity;->finish()V",
+              "    return-void",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_oncreate + content[pat.end():]
+              print("OK TransLynxActivity.onCreate() -> super + finish()")
+          else:
+              print("FAIL onCreate() not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 6: Mock getArtistsPanelInfo error -> empty success (Data Mock Phase 1)"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes7/com/vega/libeffect/repository/ResPoolRepository$getArtistsPanelInfo$getArtistsPanelInfoFromResPool$1$1$1$callback$2.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'# virtual methods\s*'
+              r'\.method public final apply\(Ljava/lang/Object;\)Ljava/lang/Object;'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_apply = "\n".join([
+              "# virtual methods",
+              ".method public final apply(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    .locals 5",
+              "",
+              "    # PATCHED Phase1: intercept -5 error, return empty success response",
+              "    new-instance v0, Ljava/util/ArrayList;",
+              "    invoke-direct {v0}, Ljava/util/ArrayList;-><init>()V",
+              "",
+              '    const-string v1, "0"',
+              '    const-string v2, ""',
+              "",
+              "    new-instance v3, Ljava/util/HashMap;",
+              "    invoke-direct {v3}, Ljava/util/HashMap;-><init>()V",
+              "",
+              "    new-instance v4, Lcom/lemon/librespool/model/gen/ArtistsPanelCategoriesResponse;",
+              "    invoke-direct {v4, v0, v1, v2, v3}, Lcom/lemon/librespool/model/gen/ArtistsPanelCategoriesResponse;-><init>(Ljava/util/ArrayList;Ljava/lang/String;Ljava/lang/String;Ljava/util/HashMap;)V",
+              "",
+              "    iget-object v0, p0, Lcom/vega/libeffect/repository/ResPoolRepository$getArtistsPanelInfo$getArtistsPanelInfoFromResPool$1$1$1$callback$2;->b:Lcom/lemon/librespool/model/gen/RequestCommonRet;",
+              "    const/4 v1, 0x0",
+              "    new-instance v2, Lkotlin/Triple;",
+              "    invoke-direct {v2, v4, v0, v1}, Lkotlin/Triple;-><init>(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+              "",
+              "    iget-object v3, p0, Lcom/vega/libeffect/repository/ResPoolRepository$getArtistsPanelInfo$getArtistsPanelInfoFromResPool$1$1$1$callback$2;->c:Lkotlinx/coroutines/CancellableContinuation;",
+              "    invoke-static {v2}, Lkotlin/Result;->constructor-impl(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    invoke-interface {v3, v2}, Lkotlin/coroutines/Continuation;->resumeWith(Ljava/lang/Object;)V",
+              "",
+              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_apply + content[pat.end():]
+              print("OK PanelInfo callback$2 -> mock empty success")
+          else:
+              print("FAIL apply() not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 7: Mock getArtistsCategoryEffects error -> empty success"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes7/com/vega/libeffect/repository/ResPoolRepository$getArtistsCategoryEffects$getArtistsCategoryEffectsFromResPool$1$1$1$callback$2.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'# virtual methods\s*'
+              r'\.method public final apply\(Ljava/lang/Object;\)Ljava/lang/Object;'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_apply = "\n".join([
+              "# virtual methods",
+              ".method public final apply(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    .locals 6",
+              "",
+              "    # PATCHED Phase1: return empty CategoryEffects response",
+              "    iget-wide v0, p0, Lcom/vega/libeffect/repository/ResPoolRepository$getArtistsCategoryEffects$getArtistsCategoryEffectsFromResPool$1$1$1$callback$2;->b:J",
+              "",
+              "    new-instance v2, Ljava/util/ArrayList;",
+              "    invoke-direct {v2}, Ljava/util/ArrayList;-><init>()V",
+              "",
+              "    const/4 v3, 0x0",
+              "    const/4 v4, 0x0",
+              '    const-string v5, ""',
+              "",
+              "    new-instance p1, Ljava/util/HashMap;",
+              "    invoke-direct {p1}, Ljava/util/HashMap;-><init>()V",
+              "",
+              "    new-instance v5, Ljava/util/ArrayList;",
+              "    invoke-direct {v5}, Ljava/util/ArrayList;-><init>()V",
+              "",
+              "    iget-object v3, p0, Lcom/vega/libeffect/repository/ResPoolRepository$getArtistsCategoryEffects$getArtistsCategoryEffectsFromResPool$1$1$1$callback$2;->g:Lkotlinx/coroutines/CancellableContinuation;",
+              "    iget-object v0, p0, Lcom/vega/libeffect/repository/ResPoolRepository$getArtistsCategoryEffects$getArtistsCategoryEffectsFromResPool$1$1$1$callback$2;->f:Lcom/lemon/librespool/model/gen/RequestCommonRet;",
+              "    const/4 v1, 0x0",
+              "",
+              "    new-instance v2, Lkotlin/Triple;",
+              "    invoke-direct {v2, v1, v0, v1}, Lkotlin/Triple;-><init>(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+              "",
+              "    invoke-static {v2}, Lkotlin/Result;->constructor-impl(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    invoke-interface {v3, v2}, Lkotlin/coroutines/Continuation;->resumeWith(Ljava/lang/Object;)V",
+              "",
+              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_apply + content[pat.end():]
+              print("OK CategoryEffects callback$2 -> mock empty success")
+          else:
+              print("FAIL apply() not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 8: Mock getArtistsCategoryEffectsWithCollections error -> empty success"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes7/com/vega/libeffect/repository/ResPoolRepository$getArtistsCategoryEffectsWithCollections$getArtistsCategoryEffectsWithCollectionsResPool$1$1$1$callback$2.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'# virtual methods\s*'
+              r'\.method public final apply\(Ljava/lang/Object;\)Ljava/lang/Object;'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_apply = "\n".join([
+              "# virtual methods",
+              ".method public final apply(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    .locals 4",
+              "",
+              "    # PATCHED Phase1: suppress error, return null-but-no-error Triple",
+              "    iget-object v3, p0, Lcom/vega/libeffect/repository/ResPoolRepository$getArtistsCategoryEffectsWithCollections$getArtistsCategoryEffectsWithCollectionsResPool$1$1$1$callback$2;->h:Lkotlinx/coroutines/CancellableContinuation;",
+              "    iget-object v0, p0, Lcom/vega/libeffect/repository/ResPoolRepository$getArtistsCategoryEffectsWithCollections$getArtistsCategoryEffectsWithCollectionsResPool$1$1$1$callback$2;->f:Lcom/lemon/librespool/model/gen/RequestCommonRet;",
+              "    const/4 v1, 0x0",
+              "",
+              "    new-instance v2, Lkotlin/Triple;",
+              "    invoke-direct {v2, v1, v0, v1}, Lkotlin/Triple;-><init>(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+              "",
+              "    invoke-static {v2}, Lkotlin/Result;->constructor-impl(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    invoke-interface {v3, v2}, Lkotlin/coroutines/Continuation;->resumeWith(Ljava/lang/Object;)V",
+              "",
+              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_apply + content[pat.end():]
+              print("OK WithCollections callback$2 -> mock empty success")
+          else:
+              print("FAIL apply() not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 9: Templates Fail-Open (FAILED→SUCCESS in error branches)"
+        run: |
+          python3 << 'PYEOF'
+          import os, sys
+
+          BASE = "smali_work/smali_classes7/com/vega/libeffect/repository"
+          targets = [
+              ("getCategoriesByMultiPanelWithCategoryId$2",
+               BASE + "/SubtitleTemplateEffectRepository$getCategoriesByMultiPanelWithCategoryId$2.smali"),
+              ("getComposeEffectWithCategoryId$2",
+               BASE + "/SubtitleTemplateEffectRepository$getComposeEffectWithCategoryId$2.smali"),
+              ("getComposeEffect$2",
+               BASE + "/SubtitleTemplateEffectRepository$getComposeEffect$2.smali"),
+          ]
+
+          total = 0
+          for name, fp in targets:
+              if not os.path.exists(fp):
+                  print(f"WARN {name}: file not found, skipping"); continue
+              with open(fp, 'r') as f:
+                  lines = f.readlines()
+              count = 0
+              i = 0
+              while i < len(lines):
+                  if 'new-instance' in lines[i] and \
+                     ('CategoryListState' in lines[i] or 'ComposeEffectListState' in lines[i]):
+                      for j in range(i + 1, min(i + 10, len(lines))):
+                          if 'RepoResult;->b:' in lines[j]:
+                              lines[j] = lines[j].replace('RepoResult;->b:', 'RepoResult;->a:')
+                              count += 1; break
+                  i += 1
+              with open(fp, 'w') as f:
+                  f.writelines(lines)
+              print(f"OK {name}: {count} FAILED→SUCCESS patches")
+              total += count
+
+          print(f"\nTotal: {total} Fail-Open patches")
+          if total == 0:
+              print("ERROR: No patches applied!"); sys.exit(1)
+          PYEOF
+
+      - name: "Patch 10: VipManager.b()Z -> always true (global VIP unlock)"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes8/com/vega/subscriptionapi/legacy/VipManager.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(r'\.method public static b\(\)Z.*?\.end method', content, re.DOTALL)
+          new_method = "\n".join([
+              ".method public static b()Z",
+              "    .locals 1",
+              "    # PATCHED: always return true (isVip = true)",
+              "    const/4 v0, 0x1",
+              "    return v0",
+              ".end method",
+          ])
+          if pat:
+              content = content[:pat.start()] + new_method + content[pat.end():]
+              print("OK VipManager.b()Z -> always true")
+          else:
+              print("FAIL b()Z not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 11: WatermarkBusinessFunction doUseFunction -> always succeed"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes8/com/vega/subscription/biz/function/WatermarkBusinessFunction$doUseFunction$1.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'\.method public final invokeSuspend\(Ljava/lang/Object;\)Ljava/lang/Object;'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_method = "\n".join([
+              ".method public final invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    .locals 4",
+              "",
+              "    # PATCHED: skip ALL VIP/watermark checks, directly call success callback",
+              "    invoke-static {p1}, Lkotlin/ResultKt;->throwOnFailure(Ljava/lang/Object;)V",
+              "",
+              "    iget-object v0, p0, Lcom/vega/subscription/biz/function/WatermarkBusinessFunction$doUseFunction$1;->s:Lkotlin/jvm/functions/Function1;",
+              "",
+              "    sget-object v1, Lcom/vega/subscriptionapi/core/Result;->d:Lcom/vega/subscriptionapi/core/Result$Companion;",
+              "    const/4 v2, 0x0",
+              '    const-string v3, "local verify success"',
+              "    const/4 p1, 0x1",
+              "    invoke-static {v1, v2, v3, p1}, Lcom/vega/subscriptionapi/core/Result$Companion;->c(Lcom/vega/subscriptionapi/core/Result$Companion;Ljava/util/Map;Ljava/lang/String;I)Lcom/vega/subscriptionapi/core/Result;",
+              "    move-result-object v1",
+              "",
+              "    invoke-interface {v0, v1}, Lkotlin/jvm/functions/Function1;->invoke(Ljava/lang/Object;)Ljava/lang/Object;",
+              "",
+              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_method + content[pat.end():]
+              print("OK doUseFunction$1.invokeSuspend -> always succeed")
+          else:
+              print("FAIL invokeSuspend not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 12: ResolutionBusinessFunction doUseFunction -> smart bypass"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes8/com/vega/subscription/biz/function/ResolutionBusinessFunction$doUseFunction$1.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'\.method public final invokeSuspend\(Ljava/lang/Object;\)Ljava/lang/Object;'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_method = "\n".join([
+              ".method public final invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    .locals 6",
+              "",
+              "    # PATCHED v2: preserve free resolution path, only bypass Pro checks",
+              "    invoke-static {p1}, Lkotlin/ResultKt;->throwOnFailure(Ljava/lang/Object;)V",
+              "",
+              "    iget-object v1, p0, Lcom/vega/subscription/biz/function/ResolutionBusinessFunction$doUseFunction$1;->q:Lcom/vega/subscription/biz/function/ResolutionBusinessFunction;",
+              "    iget-object v0, p0, Lcom/vega/subscription/biz/function/ResolutionBusinessFunction$doUseFunction$1;->r:Lcom/vega/subscriptionapi/biz/function/ResolutionBusinessParam;",
+              "    iget v0, v0, Lcom/vega/subscriptionapi/biz/function/ResolutionBusinessParam;->a:I",
+              "    invoke-virtual {v1}, Ljava/lang/Object;->getClass()Ljava/lang/Class;",
+              "    invoke-static {v0}, Lcom/vega/subscription/biz/function/ResolutionBusinessFunction;->n4(I)Lcom/lemon/lv/clipmonetize/wrapper/BenefitResource;",
+              "    move-result-object v1",
+              "",
+              "    const/4 v5, 0x1",
+              "    const/4 v4, 0x0",
+              "",
+              "    if-nez v1, :cond_pro",
+              "",
+              "    iget-object v2, p0, Lcom/vega/subscription/biz/function/ResolutionBusinessFunction$doUseFunction$1;->s:Lkotlin/jvm/functions/Function1;",
+              "    sget-object v1, Lcom/vega/subscriptionapi/core/Result;->d:Lcom/vega/subscriptionapi/core/Result$Companion;",
+              '    const-string v0, "resolution no benefit"',
+              "    invoke-static {v1, v4, v0, v5}, Lcom/vega/subscriptionapi/core/Result$Companion;->c(Lcom/vega/subscriptionapi/core/Result$Companion;Ljava/util/Map;Ljava/lang/String;I)Lcom/vega/subscriptionapi/core/Result;",
+              "    move-result-object v0",
+              "    invoke-interface {v2, v0}, Lkotlin/jvm/functions/Function1;->invoke(Ljava/lang/Object;)Ljava/lang/Object;",
+              "    goto :goto_done",
+              "",
+              "    :cond_pro",
+              "    iget-object v2, p0, Lcom/vega/subscription/biz/function/ResolutionBusinessFunction$doUseFunction$1;->s:Lkotlin/jvm/functions/Function1;",
+              "    sget-object v1, Lcom/vega/subscriptionapi/core/Result;->d:Lcom/vega/subscriptionapi/core/Result$Companion;",
+              '    const-string v0, "local verify success"',
+              "    invoke-static {v1, v4, v0, v5}, Lcom/vega/subscriptionapi/core/Result$Companion;->c(Lcom/vega/subscriptionapi/core/Result$Companion;Ljava/util/Map;Ljava/lang/String;I)Lcom/vega/subscriptionapi/core/Result;",
+              "    move-result-object v0",
+              "    invoke-interface {v2, v0}, Lkotlin/jvm/functions/Function1;->invoke(Ljava/lang/Object;)Ljava/lang/Object;",
+              "",
+              "    :goto_done",
+              "    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;",
+              "    return-object v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_method + content[pat.end():]
+              print("OK ResolutionBusinessFunction doUseFunction$1 -> smart bypass")
+          else:
+              print("FAIL invokeSuspend not found!"); sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: "Patch 13: Multi-layer VIP Export & Feature Bypass (AI UHD + all Pro)"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          patched = 0
+
+          # === 13a: BaseVipExportBusinessFunction — H1 and X2 ===
+          fp = "smali_work/smali_classes8/com/vega/subscription/biz/function/base/BaseVipExportBusinessFunction.smali"
+          with open(fp, "r") as f:
+              content = f.read()
+
+          pat = re.search(r'\.method public final H1\(Z\)Z.*?\.end method', content, re.DOTALL)
+          if pat:
+              new = "\n".join([
+                  ".method public final H1(Z)Z",
+                  "    .locals 1",
+                  "    # PATCHED: no VIP features require payment for export",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK BaseVipExport.H1(Z)Z -> false"); patched += 1
+          else:
+              print("FAIL H1 not found"); sys.exit(1)
+
+          pat = re.search(r'\.method public final X2\(\)Z.*?\.end method', content, re.DOTALL)
+          if pat:
+              new = "\n".join([
+                  ".method public final X2()Z",
+                  "    .locals 1",
+                  "    # PATCHED: alt VIP check passes",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK BaseVipExport.X2()Z -> false"); patched += 1
+          else:
+              print("FAIL X2 not found"); sys.exit(1)
+
+          with open(fp, "w") as f:
+              f.write(content)
+
+          # === 13b: VipExportBusinessFunction.p4(I)V → return void ===
+          fp = "smali_work/smali_classes8/com/vega/subscription/biz/function/VipExportBusinessFunction.smali"
+          with open(fp, "r") as f:
+              content = f.read()
+
+          pat = re.search(r'\.method public final p4\(I\)V.*?\.end method', content, re.DOTALL)
+          if pat:
+              new = "\n".join([
+                  ".method public final p4(I)V",
+                  "    .locals 0",
+                  "    # PATCHED: suppress VIP dialog on feature count change",
+                  "    return-void",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK VipExportBusiness.p4(I)V -> void"); patched += 1
+          else:
+              print("WARN p4 not found")
+
+          with open(fp, "w") as f:
+              f.write(content)
+
+          # === 13c: VipStatusExtKt — c() and d() ===
+          fp = "smali_work/smali_classes8/com/vega/subscriptionapi/ext/VipStatusExtKt.smali"
+          with open(fp, "r") as f:
+              content = f.read()
+
+          pat = re.search(
+              r'\.method public static final c\(Lcom/vega/middlebridge/swig/LVVEVipStatus;\)Z.*?\.end method',
+              content, re.DOTALL
+          )
+          if pat:
+              new = "\n".join([
+                  ".method public static final c(Lcom/vega/middlebridge/swig/LVVEVipStatus;)Z",
+                  "    .locals 1",
+                  "    # PATCHED: isPay -> always false",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK VipStatusExtKt.c() -> false"); patched += 1
+          else:
+              print("FAIL c() not found"); sys.exit(1)
+
+          pat = re.search(
+              r'\.method public static final d\(Lcom/vega/middlebridge/swig/LVVEVipStatus;\)Z.*?\.end method',
+              content, re.DOTALL
+          )
+          if pat:
+              new = "\n".join([
+                  ".method public static final d(Lcom/vega/middlebridge/swig/LVVEVipStatus;)Z",
+                  "    .locals 1",
+                  "    # PATCHED: isSVip -> always false",
+                  "    const/4 v0, 0x0",
+                  "    return v0",
+                  ".end method",
+              ])
+              content = content[:pat.start()] + new + content[pat.end():]
+              print("OK VipStatusExtKt.d() -> false"); patched += 1
+          else:
+              print("FAIL d() not found"); sys.exit(1)
+
+          with open(fp, "w") as f:
+              f.write(content)
+
+          print(f"\nTotal: {patched}/5 patches applied")
+          if patched < 4:
+              print("ERROR: Expected at least 4 patches"); sys.exit(1)
+          PYEOF
+
+      - name: "Patch 14: ExportConfigPanel.d() -> always true (AI UHD login gate bypass)"
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          filepath = "smali_work/smali_classes3/com/vega/edit/widget/ExportConfigPanel.smali"
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          # Find d(Lkotlin/jvm/functions/Function1;)Z method
+          pat = re.search(
+              r'\.method public final d\(Lkotlin/jvm/functions/Function1;\)Z'
+              r'.*?\.end method',
+              content, re.DOTALL
+          )
+
+          new_method = "\n".join([
+              ".method public final d(Lkotlin/jvm/functions/Function1;)Z",
+              "    .locals 1",
+              "    .annotation system Ldalvik/annotation/Signature;",
+              "        value = {",
+              '            "(",',
+              '            "Lkotlin/jvm/functions/Function1<",',
+              '            "-",',
+              '            "Ljava/lang/Boolean;",',
+              '            "Lkotlin/Unit;",',
+              '            ">;)Z"',
+              "        }",
+              "    .end annotation",
+              "",
+              "    # PATCHED v12a: always return true (pretend user is logged in)",
+              "    # Original: LoginService.isLogin() -> if false -> LoginUtilKt.a() -> //login",
+              "    # This is the 17ms synchronous gate that redirects to LoginActivity",
+              "    # when the AI UHD checkbox is toggled ON",
+              "    const/4 v0, 0x1",
+              "    return v0",
+              ".end method",
+          ])
+
+          if pat:
+              content = content[:pat.start()] + new_method + content[pat.end():]
+              print("OK ExportConfigPanel.d(Function1)Z -> always true (login bypass)")
+          else:
+              print("FAIL d(Function1)Z not found!")
+              sys.exit(1)
+
+          with open(filepath, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Recompile patched DEX files
+        run: |
+          java -jar apktool.jar b smali_work -o temp_dex.apk > /dev/null 2>&1 || true
+
+          if [ ! -f temp_dex.apk ]; then
+            echo "FAIL DEX recompilation failed!"
+            exit 1
+          fi
+
+          mkdir -p patched_dex
+          unzip -o temp_dex.apk classes3.dex classes7.dex classes8.dex classes15.dex -d patched_dex/ 2>/dev/null
+
+          echo "=== Patched DEX files ==="
+          ls -la patched_dex/
+
+          for f in classes3.dex classes7.dex classes8.dex classes15.dex; do
+            if [ ! -f "patched_dex/$f" ]; then
+              echo "FAIL $f missing!"
+              exit 1
+            fi
+          done
+          echo "OK All 4 DEX files present"
+
+      - name: "Patch 5: Binary modify Manifest (debuggable + allowBackup + sort)"
+        run: |
+          mkdir -p work
+          unzip -o official.apk AndroidManifest.xml -d work/
+
+          python3 << 'PYEOF'
+          import struct, sys
+
+          RESID_DEBUGGABLE = 0x0101000f
+
+          with open("work/AndroidManifest.xml", "rb") as f:
+              data = bytearray(f.read())
+
+          print(f"File size: {len(data)} bytes")
+
+          SP = 8
+          sp_chunk_size = struct.unpack_from('<I', data, SP + 4)[0]
+          sp_str_count = struct.unpack_from('<I', data, SP + 8)[0]
+          sp_hdr_sz = struct.unpack_from('<H', data, SP + 2)[0]
+          sp_flags = struct.unpack_from('<I', data, SP + 16)[0]
+          sp_str_start = struct.unpack_from('<I', data, SP + 20)[0]
+          is_utf8 = bool(sp_flags & 0x100)
+
+          OFF_BASE = SP + sp_hdr_sz
+          STR_BASE = SP + sp_str_start
+
+          str_info = {}
+          for i in range(sp_str_count):
+              rel = struct.unpack_from('<I', data, OFF_BASE + i * 4)[0]
+              pos = STR_BASE + rel
+              try:
+                  p = pos
+                  cc = struct.unpack_from('<H', data, p)[0]; p += 2
+                  if cc & 0x8000:
+                      cc = ((cc & 0x7FFF) << 16) | struct.unpack_from('<H', data, p)[0]; p += 2
+                  s = data[p:p+cc*2].decode('utf-16-le')
+                  str_info[i] = (s, pos, p + cc * 2 + 2)
+              except:
+                  str_info[i] = ("<error>", pos, pos)
+
+          native_heap_idx = -1
+          allow_backup_idx = -1
+          for idx, (s, _, _) in str_info.items():
+              if s == "allowNativeHeapPointerTagging":
+                  native_heap_idx = idx
+              elif s == "allowBackup":
+                  allow_backup_idx = idx
+
+          if native_heap_idx < 0:
+              print("FAIL allowNativeHeapPointerTagging not found!"); sys.exit(1)
+
+          RID_START = SP + sp_chunk_size
+          rid_chunk_size = struct.unpack_from('<I', data, RID_START + 4)[0]
+          rid_count = (rid_chunk_size - 8) // 4
+
+          rid_table = {}
+          for i in range(rid_count):
+              rid = struct.unpack_from('<I', data, RID_START + 8 + i * 4)[0]
+              rid_table[i] = rid
+
+          if native_heap_idx < rid_count:
+              old_rid = rid_table[native_heap_idx]
+              struct.pack_into('<I', data, RID_START + 8 + native_heap_idx * 4, RESID_DEBUGGABLE)
+              rid_table[native_heap_idx] = RESID_DEBUGGABLE
+              print(f"OK ResID[{native_heap_idx}]: 0x{old_rid:08X} -> 0x{RESID_DEBUGGABLE:08X}")
+
+          s, start, end = str_info[native_heap_idx]
+          new_name = "debuggable"
+          wp = start
+          new_u = new_name.encode('utf-16-le')
+          struct.pack_into('<H', data, wp, len(new_name)); wp += 2
+          for j, b in enumerate(new_u):
+              data[wp + j] = b
+          wp += len(new_u)
+          struct.pack_into('<H', data, wp, 0); wp += 2
+          while wp < end:
+              data[wp] = 0; wp += 1
+          print(f"OK String: '{s}' -> '{new_name}'")
+
+          pos = RID_START + rid_chunk_size
+          app_found = False
+
+          while pos < len(data) - 8:
+              c_type = struct.unpack_from('<H', data, pos)[0]
+              c_size = struct.unpack_from('<I', data, pos + 4)[0]
+              if c_size < 8 or pos + c_size > len(data):
+                  break
+              if c_type == 0x0102:
+                  elem_name_idx = struct.unpack_from('<I', data, pos + 20)[0]
+                  attr_start_off = struct.unpack_from('<H', data, pos + 24)[0]
+                  attr_size = struct.unpack_from('<H', data, pos + 26)[0]
+                  attr_count = struct.unpack_from('<H', data, pos + 28)[0]
+                  if attr_size == 0:
+                      attr_size = 20
+                  elem_name_str = str_info.get(elem_name_idx, ("<?>",))[0]
+                  a_base = pos + 16 + attr_start_off
+                  if elem_name_str == "application":
+                      app_found = True
+                      for ai in range(attr_count):
+                          ao = a_base + ai * attr_size
+                          if ao + 20 > len(data): break
+                          a_name = struct.unpack_from('<I', data, ao + 4)[0]
+                          a_type = data[ao + 15]
+                          a_val = struct.unpack_from('<i', data, ao + 16)[0]
+                          if a_name == native_heap_idx and a_type == 0x12:
+                              struct.pack_into('<i', data, ao + 16, -1)
+                              print("OK debuggable -> true")
+                          if a_name == allow_backup_idx and a_type == 0x12 and a_val == 0:
+                              struct.pack_into('<i', data, ao + 16, -1)
+                              print("OK allowBackup -> true")
+                      attr_blocks = []
+                      for ai in range(attr_count):
+                          ao = a_base + ai * attr_size
+                          block = bytes(data[ao:ao + attr_size])
+                          name_idx = struct.unpack_from('<I', block, 4)[0]
+                          rid = rid_table.get(name_idx, 0xFFFFFFFF)
+                          attr_blocks.append((rid, block))
+                      attr_blocks.sort(key=lambda x: x[0])
+                      for ai, (rid, block) in enumerate(attr_blocks):
+                          ao = a_base + ai * attr_size
+                          data[ao:ao + attr_size] = block
+                      print(f"OK {attr_count} attributes sorted by ResID")
+              pos += c_size
+
+          if not app_found:
+              print("FAIL <application> not found!"); sys.exit(1)
+
+          with open("work/AndroidManifest.xml", "wb") as f:
+              f.write(data)
+          print("DONE Manifest modification complete")
+          PYEOF
+
+      - name: Assemble patched APK
+        run: |
+          cp official.apk capcut_v12a.apk
+          zip -d capcut_v12a.apk "META-INF/*" 2>/dev/null || true
+
+          cd work
+          zip -0 ../capcut_v12a.apk AndroidManifest.xml
+          cd ..
+
+          cd patched_dex
+          zip -0 ../capcut_v12a.apk classes3.dex
+          zip -0 ../capcut_v12a.apk classes7.dex
+          zip -0 ../capcut_v12a.apk classes8.dex
+          zip -0 ../capcut_v12a.apk classes15.dex
+          cd ..
+
+          echo "=== Patched APK ==="
+          ls -la capcut_v12a.apk
+
+      - name: Align and Sign APK
+        run: |
+          ZIPALIGN=$(find "$ANDROID_HOME" -name zipalign -type f | sort -V | tail -1)
+          APKSIGNER=$(find "$ANDROID_HOME" -name apksigner -type f | sort -V | tail -1)
+
+          KS_PASS="$(printf '%s' "${{ secrets.ANDROID_KEYSTORE_PASS }}" | tr -d '\r\n')"
+          ALIAS="$(printf '%s' "${{ secrets.ANDROID_KEY_ALIAS }}" | tr -d '\r\n ')"
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > release.jks
+
+          "$ZIPALIGN" -p -f 4 capcut_v12a.apk aligned.apk
+
+          "$APKSIGNER" sign \
+            --ks release.jks \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            --key-pass pass:"$KS_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --min-sdk-version 23 \
+            --out capcut_v12a_signed.apk \
+            aligned.apk
+
+          echo "=== Signature verification ==="
+          "$APKSIGNER" verify -v capcut_v12a_signed.apk | head -10
+
+          AAPT=$(find "$ANDROID_HOME" -name "aapt" -not -name "aapt2" -type f | sort -V | tail -1)
+          "$AAPT" dump badging capcut_v12a_signed.apk 2>&1 | grep -iE "debuggable|package:"
+
+          ls -la capcut_v12a_signed.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: capcut-v16.9-v12a-uhd-login-bypass
+          path: capcut_v12a_signed.apk
+          retention-days: 7
