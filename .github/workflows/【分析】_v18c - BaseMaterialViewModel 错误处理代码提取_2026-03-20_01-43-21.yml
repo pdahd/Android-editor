@@ -1,0 +1,173 @@
+name: 【分析】_v18c - BaseMaterialViewModel 错误处理代码提取_2026-03-20_01-43-21
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. BaseMaterialViewModel 完整代码"
+        run: |
+          {
+            f=$(find decoded/ -name "BaseMaterialViewModel.smali" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 800 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- Fields ---"
+                grep -n "^\.field" "$f" | head -30
+                echo ""
+                echo "--- x5 method ---"
+                sed -n '/\.method.*x5/,/^\.end method/p' "$f"
+                echo ""
+                echo "--- y5 method ---"
+                sed -n '/\.method.*y5/,/^\.end method/p' "$f"
+              fi
+            else
+              echo "NOT FOUND"
+              find decoded/ -iname "*BaseMaterial*ViewModel*" -name "*.smali" -type f 2>/dev/null | head -10
+            fi
+          } 2>&1 | tee logs/01_base_material_vm.txt
+
+      - name: "2. CategoryListState 类定义"
+        run: |
+          {
+            f=$(find decoded/ -name "CategoryListState.smali" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              cat "$f"
+            else
+              echo "NOT FOUND"
+              find decoded/ -iname "*CategoryListState*" -name "*.smali" -type f 2>/dev/null | head -10
+            fi
+          } 2>&1 | tee logs/02_category_list_state.txt
+
+      - name: "3. RepoResult 枚举（SUCCESS/FAILED 状态定义）"
+        run: |
+          {
+            f=$(find decoded/ -name "RepoResult.smali" -path "*/libeffect/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              cat "$f"
+            else
+              echo "NOT FOUND at libeffect, searching..."
+              find decoded/ -name "RepoResult.smali" -type f 2>/dev/null | head -5
+              for f2 in $(find decoded/ -name "RepoResult.smali" -type f 2>/dev/null | head -3); do
+                echo "--- $f2 ($(wc -l < "$f2") lines) ---"
+                cat "$f2"
+              done
+            fi
+          } 2>&1 | tee logs/03_repo_result.txt
+
+      - name: "4. EffectListState / PageState 定义"
+        run: |
+          {
+            echo "=== EffectListState ==="
+            f=$(find decoded/ -name "EffectListState.smali" -path "*/effectplatform/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND"
+            fi
+
+            echo ""
+            echo "=== PageState ==="
+            f=$(find decoded/ -name "PageState.smali" -path "*/effectplatform/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND"
+              find decoded/ -name "PageState.smali" -type f 2>/dev/null | head -5
+            fi
+          } 2>&1 | tee logs/04_effect_states.txt
+
+      - name: "5. CategoriesRepository.f() 方法签名和内容"
+        run: |
+          {
+            f=$(find decoded/ -name "CategoriesRepository.smali" -path "*/libeffect/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              echo "--- Methods ---"
+              grep -n "^\.method" "$f"
+              echo ""
+              echo "--- Fields ---"
+              grep -n "^\.field" "$f" | head -20
+              echo ""
+              echo "--- error/fail/result/state references ---"
+              grep -n -i "error\|fail\|FAILED\|SUCCESS\|result\|state\|RepoResult" "$f" | head -30
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/05_categories_repo.txt
+
+      - name: "6. MultiListState（ViewModel 中使用的状态管理）"
+        run: |
+          {
+            echo "=== MultiListState 类 ==="
+            f=$(find decoded/ -name "MultiListState.smali" -path "*/vega/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              if [ $(wc -l < "$f") -lt 300 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- error/fail/network references ---"
+                grep -n -i "error\|fail\|network\|internet\|empty\|retry\|connection" "$f" | head -20
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+
+            echo ""
+            echo "=== 搜索显示 No internet connection 的 UI 代码 ==="
+            rg -rn "Connect.*internet\|internet.*try.*again\|No.*internet" decoded/res/ 2>/dev/null | head -10
+            rg -rn "0x7f12" decoded/smali_classes*/com/vega/edit/mask/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/06_multilist_state.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v18c-base-material-vm
+          path: logs/
+          retention-days: 7
