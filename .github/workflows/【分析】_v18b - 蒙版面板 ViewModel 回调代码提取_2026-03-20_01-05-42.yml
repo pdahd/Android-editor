@@ -1,0 +1,163 @@
+name: 【分析】_v18b - 蒙版面板 ViewModel 回调代码提取_2026-03-20_01-05-42
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. VideoMaskViewModel 主类（方法和字段列表）"
+        run: |
+          {
+            f=$(find decoded/ -name "VideoMaskViewModel.smali" -path "*/mask/viewmodel/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 500 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- Fields ---"
+                grep -n "^\.field" "$f"
+                echo ""
+                echo "--- error/empty/network/connection/retry references ---"
+                grep -n -i "error\|empty\|network\|connection\|retry\|fail\|no.*data\|internet" "$f" | head -30
+                echo ""
+                echo "--- LiveData / MutableLiveData ---"
+                grep -n "LiveData\|MutableLiveData\|observe\|postValue\|setValue" "$f" | head -20
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/01_viewmodel_main.txt
+
+      - name: "2. resultCallback$1（最终结果回调 - 最关键）"
+        run: |
+          {
+            f="decoded/smali_classes10/com/vega/edit/mask/viewmodel/VideoMaskViewModel\$getCategoriesWithCategoryId\$1\$resultCallback\$1.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              cat "$f"
+            else
+              echo "NOT FOUND at expected path, searching..."
+              find decoded/ -name "VideoMaskViewModel\$getCategoriesWithCategoryId*resultCallback*" -type f 2>/dev/null
+            fi
+          } 2>&1 | tee logs/02_result_callback.txt
+
+      - name: "3. hitSdkNet$1（SDK 网络结果回调）"
+        run: |
+          {
+            f="decoded/smali_classes10/com/vega/edit/mask/viewmodel/VideoMaskViewModel\$getCategoriesWithCategoryId\$1\$hitSdkNet\$1.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              cat "$f"
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/03_hit_sdk_net.txt
+
+      - name: "4. getCategoriesWithCategoryId$1 主协程"
+        run: |
+          {
+            f="decoded/smali_classes10/com/vega/edit/mask/viewmodel/VideoMaskViewModel\$getCategoriesWithCategoryId\$1.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 800 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- invokeSuspend 方法 ---"
+                sed -n '/invokeSuspend/,/^\.end method/p' "$f" | head -200
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/04_get_categories.txt
+
+      - name: "5. VerticalVideoMaskPanel 主类"
+        run: |
+          {
+            f="decoded/smali_classes15/com/vega/edit/mask/panel/VerticalVideoMaskPanel.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              echo "--- Methods ---"
+              grep -n "^\.method" "$f"
+              echo ""
+              echo "--- Fields ---"
+              grep -n "^\.field" "$f" | head -30
+              echo ""
+              echo "--- error/empty/network/internet ---"
+              grep -n -i "error\|empty\|network\|internet\|no.*data\|retry\|connection\|loading" "$f" | head -30
+              echo ""
+              echo "--- observe/LiveData ---"
+              grep -n "observe\|LiveData\|setState\|showError\|showEmpty\|visibility" "$f" | head -30
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/05_panel_main.txt
+
+      - name: "6. getCategoryEffects 的回调"
+        run: |
+          {
+            echo "=== onRequestFinish$1 ==="
+            f="decoded/smali_classes10/com/vega/edit/mask/viewmodel/VideoMaskViewModel\$getCategoryEffects\$1\$onRequestFinish\$1.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND"
+            fi
+
+            echo ""
+            echo "=== hitSdkNet$1 ==="
+            f="decoded/smali_classes10/com/vega/edit/mask/viewmodel/VideoMaskViewModel\$getCategoryEffects\$1\$hitSdkNet\$1.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              cat "$f"
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/06_effects_callbacks.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v18b-mask-viewmodel
+          path: logs/
+          retention-days: 7
