@@ -1,0 +1,230 @@
+name: 【分析】_v17a - Shark 签名验证机制全面侦察_2026-03-19_16-00-47
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. 搜索 shark 字符串（定位 shark 系统的所有代码入口）"
+        run: |
+          {
+            echo "========== 'shark' 字符串引用（所有位置）=========="
+            rg -rn -i '"shark' decoded/smali_classes*/com/ 2>/dev/null | head -50
+
+            echo ""
+            echo "========== 'block' + 'reinstall' 字符串 =========="
+            rg -rn -i "reinstall\|block.*reinstall\|shark.*block" decoded/ 2>/dev/null | grep -v "\.png\|\.xml\|\.json" | head -30
+
+            echo ""
+            echo "========== 包含 shark 的类名/文件名 =========="
+            find decoded/ -iname "*shark*" -type f 2>/dev/null | head -20
+          } 2>&1 | tee logs/01_shark_strings.txt
+
+      - name: "2. 签名读取代码（PackageManager.getPackageInfo + signatures）"
+        run: |
+          {
+            echo "========== GET_SIGNATURES / GET_SIGNING_CERTIFICATES 调用 =========="
+            rg -rn "GET_SIGNATURES\|GET_SIGNING_CERTIFICATES\|0x40\b" decoded/smali_classes*/com/vega/ 2>/dev/null | head -30
+            rg -rn "GET_SIGNATURES\|GET_SIGNING_CERTIFICATES\|0x40\b" decoded/smali_classes*/com/lemon/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== PackageInfo.signatures 读取 =========="
+            rg -rn "Landroid/content/pm/PackageInfo;->signatures\|Landroid/content/pm/PackageInfo;->signingInfo\|PackageInfo;->signaturesArray" decoded/ 2>/dev/null | head -30
+
+            echo ""
+            echo "========== getPackageInfo 调用 =========="
+            rg -rn "getPackageInfo" decoded/smali_classes*/com/vega/ 2>/dev/null | head -20
+            rg -rn "getPackageInfo" decoded/smali_classes*/com/bytedance/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== Signature.toByteArray / hashCode =========="
+            rg -rn "Landroid/content/pm/Signature;->toByteArray\|Landroid/content/pm/Signature;->hashCode" decoded/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/02_signature_reading.txt
+
+      - name: "3. Helios 组件代码（客户端白名单拦截）"
+        run: |
+          {
+            echo "========== Helios 相关文件列表 =========="
+            find decoded/ -iname "*Helios*" -name "*.smali" -type f 2>/dev/null | sort | head -30
+
+            echo ""
+            echo "========== Helios Network-White 拦截逻辑 =========="
+            rg -rn "Network-White\|Block request\|white.*list\|whitelist" decoded/smali_classes*/com/bytedance/helios/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== Helios 包结构 =========="
+            find decoded/ -path "*/helios/*" -name "*.smali" -type f 2>/dev/null | sed 's|/[^/]*\.smali||' | sort -u | head -20
+          } 2>&1 | tee logs/03_helios.txt
+
+      - name: "4. SignVerifyInterceptor 和 LynxSignVerifyInterceptor 代码"
+        run: |
+          {
+            echo "========== SignVerifyInterceptor.smali =========="
+            f=$(find decoded/ -name "SignVerifyInterceptor.smali" -path "*/vega/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              if [ $(wc -l < "$f") -lt 300 ]; then
+                cat "$f"
+              else
+                echo "--- Methods and fields ---"
+                grep -n "^\.method\|^\.field" "$f"
+                echo ""
+                echo "--- invoke calls ---"
+                grep -n "invoke-" "$f" | head -40
+                echo ""
+                echo "--- const-string ---"
+                grep -n "const-string" "$f" | head -20
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+
+            echo ""
+            echo "========== LynxSignVerifyInterceptor.smali =========="
+            f=$(find decoded/ -name "LynxSignVerifyInterceptor.smali" -path "*/vega/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              if [ $(wc -l < "$f") -lt 300 ]; then
+                cat "$f"
+              else
+                echo "--- Methods and fields ---"
+                grep -n "^\.method\|^\.field" "$f"
+                echo ""
+                echo "--- invoke calls ---"
+                grep -n "invoke-" "$f" | head -40
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/04_sign_interceptors.txt
+
+      - name: "5. RetrofitHeaderInterceptor（请求头构建，可能携带签名信息）"
+        run: |
+          {
+            echo "========== RetrofitHeaderInterceptor.smali =========="
+            f=$(find decoded/ -name "RetrofitHeaderInterceptor.smali" -path "*/vega/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              if [ $(wc -l < "$f") -lt 500 ]; then
+                cat "$f"
+              else
+                grep -n "^\.method\|^\.field\|const-string\|addHeader\|header\|sign\|token\|device\|aid" "$f" | head -50
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+
+            echo ""
+            echo "========== AssistInterceptor.smali =========="
+            f=$(find decoded/ -name "AssistInterceptor.smali" -path "*/vega/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              if [ $(wc -l < "$f") -lt 500 ]; then
+                cat "$f"
+              else
+                grep -n "^\.method\|const-string\|addHeader\|sign\|device" "$f" | head -40
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/05_header_interceptors.txt
+
+      - name: "6. ArtistPanelInfoNetwork 请求构建代码（-5 错误产生的地方）"
+        run: |
+          {
+            echo "========== ArtistPanelInfoNetwork 相关文件 =========="
+            find decoded/ -iname "*ArtistPanelInfo*" -name "*.smali" -type f 2>/dev/null | sort
+
+            echo ""
+            echo "========== ResPoolRepository panel 请求代码 =========="
+            rg -rn "videomask\|panel.*info\|get_panel_info\|get_resources_by_category" decoded/smali_classes*/com/vega/ 2>/dev/null | head -20
+            rg -rn "videomask\|panel.*info\|get_panel_info\|get_resources_by_category" decoded/smali_classes*/com/lemon/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== error_code=-5 处理代码 =========="
+            rg -rn "\-5\b.*error\|error.*\-5\b\|shark\|reinstall" decoded/smali_classes*/com/lemon/librespool/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/06_panel_request.txt
+
+      - name: "7. 对比分析：ASR请求 vs 特效请求的拦截器差异"
+        run: |
+          {
+            echo "========== ASR 请求路径（正常工作的）=========="
+            rg -rn "byteoversea\|vas-alisg\|cc_app_text_recognize" decoded/smali_classes*/com/vega/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== 特效API请求路径（被拦截的）=========="
+            rg -rn "capcutapi\|editor-api\|effectcdn\|byteeffecttos" decoded/smali_classes*/com/vega/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== AppConsts / cdnHostSuffix 初始化 =========="
+            f=$(find decoded/ -name "AppConsts.smali" -path "*/ttnet/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              grep -n "cdnHostSuffix\|getCdnHost\|init\b" "$f" | head -20
+            fi
+
+            echo ""
+            echo "========== Helios Network-White 的域名判断 =========="
+            rg -rn "capcutapi\|byteoversea\|byteeffecttos\|domain\|host\|white" decoded/smali_classes*/com/bytedance/helios/ 2>/dev/null | head -30
+          } 2>&1 | tee logs/07_request_comparison.txt
+
+      - name: "8. 设备指纹和身份 token 生成"
+        run: |
+          {
+            echo "========== device_id / install_id / aid 相关 =========="
+            rg -rn '"device_id"\|"install_id"\|"aid"\|"iid"' decoded/smali_classes*/com/vega/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== X-SS / X-Tt 请求头（字节安全头）=========="
+            rg -rn '"X-SS-\|"X-Tt-\|"x-tt-\|"X-Argus\|"X-Ladon\|"X-Gorgon\|"X-Khronos"' decoded/ 2>/dev/null | head -30
+
+            echo ""
+            echo "========== sec_device_token / risk_token =========="
+            rg -rn "sec_device_token\|risk_token\|security_token\|sec_uid" decoded/smali_classes*/com/ 2>/dev/null | head -20
+
+            echo ""
+            echo "========== 签名哈希计算（MessageDigest + SHA/MD5）=========="
+            rg -rn "MessageDigest\|SHA-256\|SHA-1\|MD5" decoded/smali_classes*/com/vega/launcher/ 2>/dev/null | head -20
+            rg -rn "MessageDigest\|SHA-256\|SHA-1\|MD5" decoded/smali_classes*/com/bytedance/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/08_device_identity.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v17a-shark-recon
+          path: logs/
+          retention-days: 7
