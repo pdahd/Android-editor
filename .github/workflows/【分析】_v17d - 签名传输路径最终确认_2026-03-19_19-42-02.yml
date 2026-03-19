@@ -1,0 +1,170 @@
+name: 【分析】_v17d - 签名传输路径最终确认_2026-03-19_19-42-02
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. RegistrationHeaderHelper 完整代码"
+        run: |
+          {
+            f="decoded/smali_classes9/com/ss/android/deviceregister/base/RegistrationHeaderHelper.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 500 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- Signature/hash related ---"
+                grep -n -i "sign\|hash\|digest\|MD5\|SHA\|toByteArray\|0x40\|sig_hash\|getPackageInfo" "$f" | head -30
+                echo ""
+                echo "--- const-string (header keys) ---"
+                grep -n "const-string" "$f" | head -40
+              fi
+            else
+              echo "NOT FOUND"
+              find decoded/ -name "RegistrationHeaderHelper*" -type f 2>/dev/null
+            fi
+          } 2>&1 | tee logs/01_reg_header.txt
+
+      - name: "2. SignUtils 完整代码"
+        run: |
+          {
+            f="decoded/smali_classes9/com/bytedance/common/utility/SignUtils.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 400 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- Key operations ---"
+                grep -n "sign\|hash\|digest\|MD5\|SHA\|toByteArray\|0x40" "$f" | head -20
+                echo ""
+                echo "--- const-string ---"
+                grep -n "const-string" "$f" | head -20
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/02_sign_utils.txt
+
+      - name: "3. RetrofitHeaderInterceptor$Companion（vega 版本，非 xt.retouch）"
+        run: |
+          {
+            echo "=== 搜索所有 RetrofitHeaderInterceptor Companion ==="
+            find decoded/ -name "RetrofitHeaderInterceptor\$Companion.smali" -type f 2>/dev/null
+
+            echo ""
+            for f in $(find decoded/ -name "RetrofitHeaderInterceptor\$Companion.smali" -path "*/vega/*" -type f 2>/dev/null); do
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              cat "$f"
+              echo ""
+            done
+
+            echo ""
+            echo "=== 搜索 Companion.b() 方法定义（sign 计算）==="
+            rg -rn "\.method.*b\(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;\)Ljava/lang/String;" decoded/smali_classes*/com/vega/launcher/ 2>/dev/null | head -10
+          } 2>&1 | tee logs/03_header_companion_vega.txt
+
+      - name: "4. 混淆类 ms/bd/o/n0 签名读取"
+        run: |
+          {
+            f="decoded/smali_classes10/ms/bd/o/n0.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 400 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- Signature related ---"
+                grep -n "toByteArray\|sign\|hash\|digest\|0x40\|getPackageInfo" "$f" | head -20
+              fi
+            else
+              echo "NOT FOUND"
+            fi
+          } 2>&1 | tee logs/04_obfuscated_n0.txt
+
+      - name: "5. ApkSignUtil 的所有调用者详细追踪"
+        run: |
+          {
+            echo "=== 谁调用 ApkSignUtil.a() (获取签名字节) ==="
+            rg -rn "ApkSignUtil;->a\(Landroid/content/Context;\)" decoded/ 2>/dev/null | head -20
+            rg -rn "Lcom/vega/util/n;->a\(Landroid/content/Context;\)" decoded/ 2>/dev/null | head -20
+
+            echo ""
+            echo "=== 谁调用 ApkSignUtil.b() (计算 SHA1) ==="
+            rg -rn "ApkSignUtil;->b\(\[B\)" decoded/ 2>/dev/null | head -20
+            rg -rn "Lcom/vega/util/n;->b\(\[B\)" decoded/ 2>/dev/null | head -20
+
+            echo ""
+            echo "=== 谁读取 AdParamUtil.c (存储的签名哈希) ==="
+            rg -rn "AdParamUtil;->c:Ljava/lang/String" decoded/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/05_sign_callers_detail.txt
+
+      - name: "6. bykvm_super128/f 签名检查"
+        run: |
+          {
+            f="decoded/smali/bykvm_super128/f.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 300 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- Signature related ---"
+                grep -n "toByteArray\|sign\|hash\|digest\|0x40\|getPackageInfo\|PackageInfo" "$f" | head -20
+              fi
+            else
+              echo "NOT FOUND"
+              find decoded/ -path "*/bykvm_super128/*" -name "*.smali" -type f 2>/dev/null | head -10
+            fi
+          } 2>&1 | tee logs/06_bykvm.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v17d-sig-final-confirm
+          path: logs/
+          retention-days: 7
