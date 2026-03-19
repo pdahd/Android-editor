@@ -1,0 +1,161 @@
+name: 【分析】_v17c - 确认所有签名读取点_2026-03-19_19-01-04
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip ripgrep
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. 所有读取 signatures 字段的代码（完整搜索）"
+        run: |
+          {
+            echo "=== PackageInfo.signatures 的所有访问（iget-object + signatures）==="
+            rg -rn "Landroid/content/pm/PackageInfo;->signatures" decoded/ 2>/dev/null | head -30
+
+            echo ""
+            echo "=== Signature.toByteArray 的所有调用 ==="
+            rg -rn "Landroid/content/pm/Signature;->toByteArray" decoded/ 2>/dev/null | head -30
+
+            echo ""
+            echo "=== 0x40 (GET_SIGNATURES) 与 getPackageInfo 组合 ==="
+            rg -rn "const/16 v., 0x40" decoded/smali_classes*/com/vega/ 2>/dev/null | head -20
+            rg -rn "const/16 v., 0x40" decoded/smali_classes*/com/bytedance/ 2>/dev/null | head -20
+
+            echo ""
+            echo "=== signingInfo (API 28+) ==="
+            rg -rn "signingInfo\|getSigningInfo\|GET_SIGNING_CERTIFICATES\|0x8000000" decoded/ 2>/dev/null | head -20
+          } 2>&1 | tee logs/01_all_sig_reads.txt
+
+      - name: "2. RetrofitHeaderInterceptor$Companion 的 b() 方法（sign 计算）"
+        run: |
+          {
+            f=$(find decoded/ -name "RetrofitHeaderInterceptor\$Companion.smali" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              cat "$f"
+            else
+              echo "NOT FOUND"
+              find decoded/ -name "RetrofitHeaderInterceptor*" -name "*.smali" -type f 2>/dev/null
+            fi
+          } 2>&1 | tee logs/02_header_companion.txt
+
+      - name: "3. HybridLynxModule 使用签名的完整代码"
+        run: |
+          {
+            f="decoded/smali_classes10/com/vega/lynx/HybridLynxModule\$hostLynxConfig\$1.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              cat "$f"
+            else
+              echo "NOT FOUND, searching..."
+              find decoded/ -name "HybridLynxModule*" -name "*.smali" -type f 2>/dev/null
+              for f2 in $(find decoded/ -name "HybridLynxModule*hostLynxConfig*" -type f 2>/dev/null); do
+                echo "--- $f2 ---"
+                cat "$f2"
+              done
+            fi
+          } 2>&1 | tee logs/03_lynx_module.txt
+
+      - name: "4. DeviceManager 初始化（SigHashLoader 的调用上下文）"
+        run: |
+          {
+            f="decoded/smali_classes9/com/bytedance/bdinstall/loader/DeviceManager.smali"
+            if [ -f "$f" ]; then
+              echo "=== $f ($(wc -l < "$f") lines) ==="
+              if [ $(wc -l < "$f") -lt 500 ]; then
+                cat "$f"
+              else
+                echo "--- Methods ---"
+                grep -n "^\.method" "$f"
+                echo ""
+                echo "--- sig_hash / SigHash 引用 ---"
+                grep -n -i "sig.*hash\|SigHash\|signature" "$f" | head -20
+                echo ""
+                echo "--- Loader 注册部分 ---"
+                grep -n "Loader\|loader\|register\|add" "$f" | head -30
+              fi
+            fi
+          } 2>&1 | tee logs/04_device_manager.txt
+
+      - name: "5. native 层签名检查（SO 文件中的 getPackageInfo/signature）"
+        run: |
+          {
+            echo "=== APK 中的 SO 文件列表（只看关键的）==="
+            unzip -l official.apk "lib/arm64-v8a/*.so" 2>/dev/null | grep -iE "crack|sign|shark|helios|sec|verify|ttnet|bdinstall" | head -20
+
+            echo ""
+            echo "=== 所有 native 方法声明中包含 sign/crack/verify 的 ==="
+            rg -rn "\.method.*native.*" decoded/ 2>/dev/null | grep -iE "sign|crack|verify|hash|cert|package" | head -20
+
+            echo ""
+            echo "=== CrackingInterceptor 的 native intercept 方法确认 ==="
+            grep -A2 "\.method.*native.*intercept" decoded/smali_classes7/com/vega/launcher/network/interceptors/CrackingInterceptor.smali 2>/dev/null
+          } 2>&1 | tee logs/05_native_checks.txt
+
+      - name: "6. TicketGuard（字节的安全 token 系统）"
+        run: |
+          {
+            echo "=== TicketGuard 相关文件 ==="
+            find decoded/ -iname "*TicketGuard*" -name "*.smali" -type f 2>/dev/null | sort | head -15
+
+            echo ""
+            echo "=== TicketGuardProviderKt（v17a 发现它读 getPackageInfo）==="
+            f="decoded/smali_classes9/com/bytedance/android/sdk/ticketguard/TicketGuardProviderKt.smali"
+            if [ -f "$f" ]; then
+              echo "File: $f ($(wc -l < "$f") lines)"
+              if [ $(wc -l < "$f") -lt 300 ]; then
+                cat "$f"
+              else
+                grep -n "^\.method\|const-string\|sign\|hash\|package\|getPackageInfo\|0x40" "$f" | head -30
+              fi
+            fi
+
+            echo ""
+            echo "=== Dsign 相关 ==="
+            find decoded/ -name "Dsign*" -name "*.smali" -type f 2>/dev/null | head -10
+            f=$(find decoded/ -name "Dsign.smali" -path "*/bdinstall/*" -type f 2>/dev/null | head -1)
+            if [ -n "$f" ]; then
+              echo "--- $f ---"
+              grep -n "^\.method\|sign\|hash\|ticket\|guard" "$f" | head -20
+            fi
+          } 2>&1 | tee logs/06_ticketguard.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v17c-sig-confirm
+          path: logs/
+          retention-days: 7
