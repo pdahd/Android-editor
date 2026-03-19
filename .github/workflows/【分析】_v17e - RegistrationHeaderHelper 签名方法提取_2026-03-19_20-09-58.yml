@@ -1,0 +1,79 @@
+name: 【分析】_v17e - RegistrationHeaderHelper 签名方法提取_2026-03-19_20-09-58
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip
+          curl -fL --retry 5 -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompile
+        run: java -jar apktool.jar d -f -r official.apk -o decoded > /dev/null 2>&1 || true
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: "1. getSigHash 方法完整代码"
+        run: |
+          {
+            f="decoded/smali_classes9/com/ss/android/deviceregister/base/RegistrationHeaderHelper.smali"
+            echo "=== getSigHash 方法 (行 3541 开始) ==="
+            sed -n '3541,3700p' "$f"
+          } 2>&1 | tee logs/01_get_sig_hash.txt
+
+      - name: "2. prepareSigHash 方法完整代码"
+        run: |
+          {
+            f="decoded/smali_classes9/com/ss/android/deviceregister/base/RegistrationHeaderHelper.smali"
+            echo "=== prepareSigHash 方法 (行 3940 开始) ==="
+            sed -n '3940,4100p' "$f"
+          } 2>&1 | tee logs/02_prepare_sig_hash.txt
+
+      - name: "3. getHeader 方法中调用 prepareSigHash 的上下文"
+        run: |
+          {
+            f="decoded/smali_classes9/com/ss/android/deviceregister/base/RegistrationHeaderHelper.smali"
+            echo "=== getHeader 中 prepareSigHash 调用点 (行 2400-2450) ==="
+            sed -n '2400,2450p' "$f"
+          } 2>&1 | tee logs/03_header_context.txt
+
+      - name: "4. sSigHash 字段的所有读写"
+        run: |
+          {
+            f="decoded/smali_classes9/com/ss/android/deviceregister/base/RegistrationHeaderHelper.smali"
+            echo "=== sSigHash 的所有引用 ==="
+            grep -n "sSigHash" "$f"
+          } 2>&1 | tee logs/04_ssighash_refs.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v17e-reg-header-sig
+          path: logs/
+          retention-days: 7
