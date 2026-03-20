@@ -1,4 +1,4 @@
-name: 【分析】_v19b - Ghidra 深度分析 libmetasec_ov.so_2026-03-20_15-23-21
+name: 【分析】v19b - Ghidra 深度分析 libmetasec_ov.so
 
 on:
   workflow_dispatch:
@@ -41,9 +41,11 @@ jobs:
           unzip -o official.apk "lib/arm64-v8a/libmetasec_ov.so" -d so_files/
           ls -la so_files/lib/arm64-v8a/
 
-      - name: Create analysis script
+      - name: Create analysis script and directories
         run: |
           mkdir -p logs
+          mkdir -p /tmp/ghidra_proj
+          mkdir -p /tmp/ghidra_output
           cat > /tmp/MetasecAnalysis.java << 'JAVA_SCRIPT'
           import ghidra.app.script.GhidraScript;
           import ghidra.program.model.symbol.*;
@@ -60,7 +62,6 @@ jobs:
                   FunctionManager fm = currentProgram.getFunctionManager();
                   Listing listing = currentProgram.getListing();
                   String outDir = "/tmp/ghidra_output";
-                  new File(outDir).mkdirs();
 
                   // 1. All functions
                   PrintWriter pw1 = new PrintWriter(new File(outDir + "/01_all_functions.txt"));
@@ -130,21 +131,27 @@ jobs:
                   // 4. Top 50 largest functions
                   PrintWriter pw4 = new PrintWriter(new File(outDir + "/04_large_functions.txt"));
                   pw4.println("=== Top 50 Largest Functions ===");
-                  List<String[]> funcList = new ArrayList<>();
+                  List<long[]> sizes = new ArrayList<>();
+                  List<String> names = new ArrayList<>();
+                  List<String> addrs = new ArrayList<>();
                   fIter = fm.getFunctions(true);
                   while (fIter.hasNext()) {
                       Function fn = fIter.next();
-                      funcList.add(new String[]{fn.getEntryPoint().toString(), fn.getName(),
-                          String.valueOf(fn.getBody().getNumAddresses())});
+                      long sz = fn.getBody().getNumAddresses();
+                      sizes.add(new long[]{sz});
+                      names.add(fn.getName());
+                      addrs.add(fn.getEntryPoint().toString());
                   }
-                  funcList.sort((a, b) -> Long.compare(Long.parseLong(b[2]), Long.parseLong(a[2])));
-                  for (int i = 0; i < Math.min(50, funcList.size()); i++) {
-                      String[] f = funcList.get(i);
-                      pw4.println(f[0] + " | " + f[1] + " | size=" + f[2]);
+                  Integer[] indices = new Integer[sizes.size()];
+                  for (int i = 0; i < indices.length; i++) indices[i] = i;
+                  Arrays.sort(indices, (a, b) -> Long.compare(sizes.get(b)[0], sizes.get(a)[0]));
+                  for (int i = 0; i < Math.min(50, indices.length); i++) {
+                      int idx = indices[i];
+                      pw4.println(addrs.get(idx) + " | " + names.get(idx) + " | size=" + sizes.get(idx)[0]);
                   }
                   pw4.close();
 
-                  // 5. String references for key terms
+                  // 5. String references
                   PrintWriter pw5 = new PrintWriter(new File(outDir + "/05_string_xrefs.txt"));
                   pw5.println("=== String Cross-References ===");
                   DataIterator dIter = listing.getDefinedData(true);
@@ -157,7 +164,8 @@ jobs:
                               s.contains("getpackage") || s.contains("/data/data") ||
                               s.contains("base.apk") || s.contains("metasec") ||
                               s.contains("pitaya") || s.contains("jwp_call") ||
-                              s.contains("should_have") || s.contains("package_version")) {
+                              s.contains("should_have") || s.contains("package_version") ||
+                              s.contains("registernative") || s.contains("findclass")) {
                               pw5.println("\nString: \"" + val + "\" at " + data.getAddress());
                               ReferenceIterator refs = data.getReferenceIteratorTo();
                               while (refs.hasNext()) {
@@ -171,13 +179,17 @@ jobs:
                   }
                   pw5.close();
 
-                  println("Analysis complete!");
+                  println("Analysis complete! Files in " + outDir);
               }
           }
           JAVA_SCRIPT
 
       - name: Run Ghidra analysis
         run: |
+          export JAVA_HOME=$JAVA_HOME_17_X64
+          export PATH=$JAVA_HOME/bin:$PATH
+          java -version
+          
           SO="so_files/lib/arm64-v8a/libmetasec_ov.so"
           ghidra/support/analyzeHeadless /tmp/ghidra_proj MetasecProject \
             -import "$SO" \
@@ -193,9 +205,8 @@ jobs:
               cp "$f" logs/
             fi
           done
-          # Fallback if no output
           if [ ! "$(ls -A logs/ 2>/dev/null)" ]; then
-            echo "No analysis output generated" > logs/00_status.txt
+            echo "No output generated" > logs/00_status.txt
           fi
           ls -la logs/
 
