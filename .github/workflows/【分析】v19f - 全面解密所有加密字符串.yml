@@ -1,0 +1,392 @@
+name: 【分析】v19f - 全面解密所有加密字符串
+
+on:
+  workflow_dispatch:
+
+jobs:
+  decrypt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Ghidra and tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip python3
+          curl -fL --retry 3 -o ghidra.zip \
+            https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0.4_build/ghidra_12.0.4_PUBLIC_20260303.zip
+          unzip -q ghidra.zip
+          mv ghidra_* ghidra
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract SO
+        run: |
+          mkdir -p so_files logs
+          unzip -o official.apk "lib/arm64-v8a/libmetasec_ov.so" -d so_files/
+
+      - name: Create comprehensive extraction script
+        run: |
+          mkdir -p /tmp/ghidra_proj /tmp/ghidra_output
+          cat > /tmp/FullDecrypt.java << 'JAVA_SCRIPT'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.symbol.*;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.address.*;
+          import ghidra.program.model.mem.*;
+          import ghidra.program.model.scalar.*;
+          import ghidra.program.model.pcode.*;
+          import java.io.*;
+          import java.util.*;
+
+          public class FullDecrypt extends GhidraScript {
+
+              @Override
+              public void run() throws Exception {
+                  Memory mem = currentProgram.getMemory();
+                  FunctionManager fm = currentProgram.getFunctionManager();
+                  ReferenceManager rm = currentProgram.getReferenceManager();
+                  Listing listing = currentProgram.getListing();
+                  
+                  PrintWriter pw = new PrintWriter(new File("/tmp/ghidra_output/full_extract.txt"));
+
+                  // 5 decrypt function addresses
+                  long[] decAddrs = {0x268aa4L, 0x269a34L, 0x26941cL, 0x2692b4L, 0x268c24L};
+                  String[] decNames = {"A_268aa4", "B_269a34", "C_26941c", "D_2692b4", "E_268c24"};
+
+                  // For each decrypt function, find all callers and extract context
+                  for (int d = 0; d < decAddrs.length; d++) {
+                      Address decAddr = currentProgram.getAddressFactory()
+                          .getDefaultAddressSpace().getAddress(decAddrs[d]);
+                      
+                      pw.println("=== CALLERS OF " + decNames[d] + " ===");
+                      
+                      ReferenceIterator refs = rm.getReferencesTo(decAddr);
+                      int count = 0;
+                      while (refs.hasNext() && count < 80) {
+                          Reference ref = refs.next();
+                          Address callAddr = ref.getFromAddress();
+                          Function caller = fm.getFunctionContaining(callAddr);
+                          String callerName = caller != null ? caller.getName() : "unknown";
+                          
+                          // Scan backwards from call site to find data references
+                          // Look for ADRP+ADD or LDR patterns that load encrypted data addresses
+                          StringBuilder context = new StringBuilder();
+                          Address scanAddr = callAddr;
+                          Set<Long> dataAddrs = new TreeSet<>();
+                          
+                          // Scan up to 20 instructions before the call
+                          for (int i = 0; i < 20; i++) {
+                              Instruction inst = listing.getInstructionBefore(scanAddr);
+                              if (inst == null) break;
+                              scanAddr = inst.getAddress();
+                              
+                              // Check for references from this instruction
+                              Reference[] instRefs = inst.getReferencesFrom();
+                              for (Reference ir : instRefs) {
+                                  long target = ir.getToAddress().getOffset();
+                                  // Filter for data section addresses (0x26xxxx - 0x2Bxxxx)
+                                  if (target >= 0x260000L && target <= 0x2C0000L) {
+                                      dataAddrs.add(target);
+                                  }
+                              }
+                              
+                              // Also check for scalar operands that look like data addresses
+                              for (int op = 0; op < inst.getNumOperands(); op++) {
+                                  Object[] opObjs = inst.getOpObjects(op);
+                                  for (Object obj : opObjs) {
+                                      if (obj instanceof Scalar) {
+                                          long val = ((Scalar)obj).getUnsignedValue();
+                                          if (val >= 0x260000L && val <= 0x2C0000L) {
+                                              dataAddrs.add(val);
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                          
+                          pw.print("CALL " + callAddr + " in " + callerName + " data_refs=[");
+                          boolean first = true;
+                          for (Long addr : dataAddrs) {
+                              if (!first) pw.print(",");
+                              pw.print("0x" + Long.toHexString(addr));
+                              first = false;
+                          }
+                          pw.println("]");
+                          
+                          count++;
+                      }
+                      pw.println();
+                  }
+
+                  // Dump comprehensive data regions
+                  pw.println("=== XOR KEYS ===");
+                  pw.println("KEY_A=" + hexDump(mem, 0x28b240L, 8));
+                  pw.println("KEY_B=" + hexDump(mem, 0x28b260L, 8));
+                  pw.println("KEY_C=" + hexDump(mem, 0x28b258L, 8));
+                  pw.println("KEY_D=" + hexDump(mem, 0x28b250L, 8));
+                  pw.println("KEY_E=" + hexDump(mem, 0x28b248L, 8));
+
+                  // Dump wide data regions where encrypted strings live
+                  pw.println("\n=== DATA REGIONS ===");
+                  // Main encrypted string regions (identified from cross-references)
+                  for (long base = 0x26b700L; base <= 0x28c000L; base += 0x100) {
+                      String hex = hexDump(mem, base, 256);
+                      if (hex != null) {
+                          pw.println("DATA_" + Long.toHexString(base) + "=" + hex);
+                      }
+                  }
+
+                  pw.flush();
+                  pw.close();
+                  println("Full extraction complete!");
+              }
+              
+              private String hexDump(Memory mem, long offset, int length) {
+                  try {
+                      Address addr = currentProgram.getAddressFactory()
+                          .getDefaultAddressSpace().getAddress(offset);
+                      byte[] bytes = new byte[length];
+                      mem.getBytes(addr, bytes);
+                      StringBuilder sb = new StringBuilder();
+                      for (byte b : bytes) sb.append(String.format("%02x", b & 0xFF));
+                      return sb.toString();
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+          }
+          JAVA_SCRIPT
+
+      - name: Run Ghidra extraction
+        run: |
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          export PATH=$JAVA_HOME/bin:$PATH
+          
+          ghidra/support/analyzeHeadless /tmp/ghidra_proj MetasecProject \
+            -import so_files/lib/arm64-v8a/libmetasec_ov.so \
+            -processor AARCH64:LE:64:v8A \
+            -scriptPath /tmp \
+            -postScript FullDecrypt.java \
+            2>&1 | tail -5
+
+      - name: Decrypt everything
+        run: |
+          python3 << 'PYEOF'
+          import sys, re
+
+          # XOR keys (verified from v19e)
+          KEYS = {
+              'A': bytes.fromhex('a51071c75090e1b1'),
+              'B': bytes.fromhex('a51281d7601071b2'),
+              'C': bytes.fromhex('a75078c96097eff1'),
+              'D': bytes.fromhex('b52091e740a0e3b6'),
+              'E': bytes.fromhex('351f7ff7909fe1b1'),
+          }
+
+          def xor_decrypt(data, key):
+              return bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+
+          def is_readable(data):
+              try:
+                  text = data.decode('ascii')
+                  return all(32 <= ord(c) < 127 or c == '\0' for c in text) and any(c.isalpha() for c in text)
+              except:
+                  return False
+
+          # Read extracted data
+          lines = open("/tmp/ghidra_output/full_extract.txt").readlines()
+          
+          # Parse data regions
+          data_regions = {}
+          for line in lines:
+              line = line.strip()
+              if line.startswith("DATA_") and "=" in line:
+                  key, val = line.split("=", 1)
+                  addr = int(key.split("_")[1], 16)
+                  try:
+                      data_regions[addr] = bytes.fromhex(val)
+                  except:
+                      pass
+              elif line.startswith("KEY_") and "=" in line and len(line.split("=")[1]) == 16:
+                  pass  # Already have keys
+
+          # Parse call sites and their data references
+          call_sites = []
+          for line in lines:
+              m = re.match(r'CALL (0x[\da-f]+) in (\S+) data_refs=\[(.*)\]', line)
+              if m:
+                  call_addr = m.group(1)
+                  caller = m.group(2)
+                  refs = [int(x, 16) for x in m.group(3).split(',') if x.strip()] if m.group(3) else []
+                  # Determine which decrypt function
+                  decrypt_fn = "?"
+                  for l in lines:
+                      if l.startswith("=== CALLERS OF ") and call_addr in lines[lines.index(l):lines.index(l)+100]:
+                          decrypt_fn = l.split("CALLERS OF ")[1].split(" ===")[0] if "CALLERS OF " in l else "?"
+                          break
+                  call_sites.append((call_addr, caller, refs, decrypt_fn))
+
+          print("=" * 80)
+          print(f"TOTAL DATA REGIONS: {len(data_regions)}")
+          print(f"TOTAL CALL SITES PARSED: {len(call_sites)}")
+          print("=" * 80)
+
+          # For every data reference found near decrypt calls,
+          # try all keys and all reasonable lengths
+          all_decrypted = {}
+          
+          # Build a flat memory image from data regions
+          flat_mem = {}
+          for base_addr, region_data in sorted(data_regions.items()):
+              for i, b in enumerate(region_data):
+                  flat_mem[base_addr + i] = b
+
+          def read_from_flat(addr, length):
+              result = bytearray()
+              for i in range(length):
+                  if addr + i in flat_mem:
+                      result.append(flat_mem[addr + i])
+                  else:
+                      return None
+              return bytes(result)
+
+          print("\n" + "=" * 80)
+          print("SYSTEMATIC DECRYPTION OF ALL DATA REFERENCES")
+          print("=" * 80)
+
+          seen_readable = set()
+          
+          # Collect all unique data addresses from call sites
+          all_data_addrs = set()
+          for _, _, refs, _ in call_sites:
+              all_data_addrs.update(refs)
+          
+          print(f"\nUnique data addresses referenced near decrypt calls: {len(all_data_addrs)}")
+          
+          # Try each address with each key and multiple lengths
+          for addr in sorted(all_data_addrs):
+              for key_name, key in KEYS.items():
+                  for length in [8, 10, 12, 14, 16, 17, 18, 19, 20, 21, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 48, 64, 96]:
+                      raw = read_from_flat(addr, length)
+                      if raw is None:
+                          continue
+                      dec = xor_decrypt(raw, key)
+                      if is_readable(dec):
+                          text = dec.decode('ascii', errors='replace').rstrip('\x00')
+                          if len(text) >= 3 and text not in seen_readable:
+                              # Check it's a meaningful string (not just repeated chars)
+                              if len(set(text)) > 2:
+                                  sig = f"0x{addr:x}_key{key_name}_len{length}"
+                                  all_decrypted[sig] = text
+                                  seen_readable.add(text)
+
+          # Also scan entire data regions with all keys
+          print("\n" + "=" * 80)
+          print("SCANNING ALL DATA REGIONS FOR JAVA PATTERNS")  
+          print("=" * 80)
+
+          java_patterns = [
+              'android/', 'java/', 'com/', 'org/',
+              'Landroid', 'Ljava', 'Lcom/',
+              'PackageManager', 'PackageInfo', 'getPackage', 
+              'Signature', 'signatures', 'getSign', 'certificate',
+              'Context', 'Application', 'content/pm',
+              'MessageDigest', 'SHA', 'MD5', 'hash',
+              'base.apk', '/data/app', 'META-INF',
+              'install', 'reinstall', 'shark', 'block',
+              'verify', 'check', 'valid', 'tamper', 'integrity',
+              'hook', 'frida', 'xposed', 'substrate', 'magisk',
+              'debug', 'root', 'su ', '/su',
+              'getPackageName', 'versionCode', 'versionName',
+              'getApplicationInfo', 'getInstallerPackage',
+              'CERT.RSA', 'CERT.SF', 'MANIFEST.MF',
+              'X509', 'RSA', 'DSA',
+          ]
+
+          region_matches = {}
+          for base_addr, region_data in sorted(data_regions.items()):
+              for key_name, key in KEYS.items():
+                  dec = xor_decrypt(region_data, key)
+                  text = dec.decode('ascii', errors='replace')
+                  for pattern in java_patterns:
+                      idx = text.lower().find(pattern.lower())
+                      while idx >= 0:
+                          start = max(0, idx - 5)
+                          end = min(len(text), idx + len(pattern) + 50)
+                          snippet = text[start:end]
+                          clean = ''.join(c if (32 <= ord(c) < 127) else '|' for c in snippet)
+                          match_key = f"0x{base_addr + idx:x}_key{key_name}"
+                          if match_key not in region_matches:
+                              region_matches[match_key] = clean
+                              addr = base_addr + idx - (base_addr + idx) % 8  # Align to key
+                              print(f"  MATCH at 0x{base_addr+idx:x} [key {key_name}]: {clean}")
+                          idx = text.lower().find(pattern.lower(), idx + 1)
+
+          # Print all decrypted strings sorted by content
+          print("\n" + "=" * 80)
+          print(f"ALL DECRYPTED READABLE STRINGS ({len(all_decrypted)} found)")
+          print("=" * 80)
+          
+          for sig, text in sorted(all_decrypted.items(), key=lambda x: x[1].lower()):
+              print(f"  {sig}: {text}")
+
+          # Highlight security-critical strings
+          print("\n" + "=" * 80)
+          print("SECURITY-CRITICAL STRINGS")
+          print("=" * 80)
+
+          critical_keywords = ['package', 'sign', 'cert', 'hash', 'digest', 'verify', 
+                              'hook', 'frida', 'xposed', 'root', 'debug', 'tamper',
+                              'install', 'integrity', 'apk', 'base.apk', 'meta-inf',
+                              'shark', 'block', 'reinstall', 'getpackage']
+          
+          for sig, text in sorted(all_decrypted.items()):
+              for kw in critical_keywords:
+                  if kw in text.lower():
+                      print(f"  🔴 {sig}: {text}")
+                      break
+
+          for match_key, clean in sorted(region_matches.items()):
+              for kw in critical_keywords:
+                  if kw in clean.lower():
+                      print(f"  🔴 {match_key}: {clean}")
+                      break
+
+          # Save results
+          with open("/tmp/ghidra_output/all_decrypted.txt", "w") as f:
+              f.write("=== ALL DECRYPTED STRINGS ===\n\n")
+              for sig, text in sorted(all_decrypted.items(), key=lambda x: x[1].lower()):
+                  f.write(f"{sig}: {text}\n")
+              f.write(f"\n=== REGION PATTERN MATCHES ===\n\n")
+              for mk, clean in sorted(region_matches.items()):
+                  f.write(f"{mk}: {clean}\n")
+
+          PYEOF
+
+      - name: Collect results
+        if: always()
+        run: |
+          cp /tmp/ghidra_output/*.txt logs/ 2>/dev/null || true
+          ls -la logs/
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v19f-full-decrypt
+          path: logs/
+          retention-days: 7
