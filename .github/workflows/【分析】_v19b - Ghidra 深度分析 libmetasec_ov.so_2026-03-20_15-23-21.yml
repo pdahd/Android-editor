@@ -21,10 +21,9 @@ jobs:
       - name: Install Ghidra
         run: |
           curl -fL --retry 3 -o ghidra.zip \
-            https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3_build/ghidra_11.3_PUBLIC_20250205.zip
+            https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0.4_build/ghidra_12.0.4_PUBLIC_20260303.zip
           unzip -q ghidra.zip
           mv ghidra_* ghidra
-          echo "$PWD/ghidra/support" >> $GITHUB_PATH
 
       - name: Install tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq unzip binutils
@@ -42,133 +41,162 @@ jobs:
           unzip -o official.apk "lib/arm64-v8a/libmetasec_ov.so" -d so_files/
           ls -la so_files/lib/arm64-v8a/
 
-      - name: Create logs directory
-        run: mkdir -p logs
-
-      - name: "Ghidra headless analysis + export"
+      - name: Create analysis script
         run: |
-          SO="so_files/lib/arm64-v8a/libmetasec_ov.so"
-          
-          # Create Ghidra project and analyze
-          ghidra/support/analyzeHeadless /tmp/ghidra_proj MetasecProject \
-            -import "$SO" \
-            -processor AARCH64:LE:64:v8A \
-            -postScript /dev/stdin << 'GHIDRA_SCRIPT'
+          mkdir -p logs
+          cat > /tmp/MetasecAnalysis.java << 'JAVA_SCRIPT'
+          import ghidra.app.script.GhidraScript;
           import ghidra.program.model.symbol.*;
           import ghidra.program.model.listing.*;
           import ghidra.program.model.address.*;
+          import ghidra.program.model.data.*;
+          import ghidra.app.decompiler.*;
           import java.io.*;
+          import java.util.*;
 
-          def fm = currentProgram.getFunctionManager()
-          def listing = currentProgram.getListing()
-          def mem = currentProgram.getMemory()
-          def symTable = currentProgram.getSymbolTable()
+          public class MetasecAnalysis extends GhidraScript {
+              @Override
+              public void run() throws Exception {
+                  FunctionManager fm = currentProgram.getFunctionManager();
+                  Listing listing = currentProgram.getListing();
+                  String outDir = "/tmp/ghidra_output";
+                  new File(outDir).mkdirs();
 
-          // 1. Export all functions with their sizes
-          def pw1 = new PrintWriter(new File("/tmp/ghidra_proj/functions.txt"))
-          pw1.println("=== All Functions (${fm.getFunctionCount()}) ===")
-          fm.getFunctions(true).each { fn ->
-            pw1.println("${fn.getEntryPoint()} | ${fn.getName()} | size=${fn.getBody().getNumAddresses()}")
-          }
-          pw1.close()
-
-          // 2. Export functions containing key strings in their name
-          def pw2 = new PrintWriter(new File("/tmp/ghidra_proj/key_functions.txt"))
-          pw2.println("=== Key Functions (sign/verify/check/hash/package/init/jni) ===")
-          fm.getFunctions(true).each { fn ->
-            def name = fn.getName().toLowerCase()
-            if (name.contains("sign") || name.contains("verify") || name.contains("check") ||
-                name.contains("hash") || name.contains("package") || name.contains("init") ||
-                name.contains("jni") || name.contains("cert") || name.contains("valid") ||
-                name.contains("metasec") || name.contains("pitaya") || name.contains("jwp") ||
-                name.contains("wasm") || name.contains("vm_") || name.contains("_vm") ||
-                name.contains("shark") || name.contains("block") || name.contains("risk")) {
-              pw2.println("${fn.getEntryPoint()} | ${fn.getName()} | size=${fn.getBody().getNumAddresses()}")
-            }
-          }
-          pw2.close()
-
-          // 3. Export JNI_OnLoad decompilation
-          def pw3 = new PrintWriter(new File("/tmp/ghidra_proj/jni_onload.txt"))
-          pw3.println("=== JNI_OnLoad Decompilation ===")
-          def jniFunc = null
-          fm.getFunctions(true).each { fn ->
-            if (fn.getName() == "JNI_OnLoad") jniFunc = fn
-          }
-          if (jniFunc != null) {
-            def decompInterface = new ghidra.app.decompiler.DecompInterface()
-            decompInterface.openProgram(currentProgram)
-            def results = decompInterface.decompileFunction(jniFunc, 60, monitor)
-            if (results != null && results.depiledFunction != null) {
-              pw3.println(results.getDecompiledFunction().getC())
-            } else if (results != null) {
-              pw3.println(results.getErrorMessage())
-              // Fallback: print assembly
-              pw3.println("\n=== Assembly fallback ===")
-              def body = jniFunc.getBody()
-              def iter = listing.getInstructions(body, true)
-              def count = 0
-              while (iter.hasNext() && count < 200) {
-                def inst = iter.next()
-                pw3.println("${inst.getAddress()} ${inst}")
-                count++
-              }
-            }
-            decompInterface.dispose()
-          } else {
-            pw3.println("JNI_OnLoad not found!")
-          }
-          pw3.close()
-
-          // 4. Export cross-references to key strings
-          def pw4 = new PrintWriter(new File("/tmp/ghidra_proj/string_xrefs.txt"))
-          pw4.println("=== Cross-references to key strings ===")
-          def strings = currentProgram.getListing().getDefinedData(true)
-          strings.each { data ->
-            if (data.getDataType().getName().contains("string") || data.getDataType().getName().contains("char")) {
-              def val = data.getValue()
-              if (val != null) {
-                def s = val.toString().toLowerCase()
-                if (s.contains("signature") || s.contains("package") || s.contains("hash") ||
-                    s.contains("sign") || s.contains("verify") || s.contains("/data/data") ||
-                    s.contains("base.apk") || s.contains("metasec") || s.contains("pitaya") ||
-                    s.contains("jwp_call") || s.contains("shark") || s.contains("reinstall")) {
-                  pw4.println("\nString: \"${val}\" at ${data.getAddress()}")
-                  def refs = data.getReferenceIteratorTo()
-                  refs.each { ref ->
-                    def refFn = fm.getFunctionContaining(ref.getFromAddress())
-                    def fnName = refFn != null ? refFn.getName() : "unknown"
-                    pw4.println("  Referenced by: ${ref.getFromAddress()} in ${fnName}")
+                  // 1. All functions
+                  PrintWriter pw1 = new PrintWriter(new File(outDir + "/01_all_functions.txt"));
+                  pw1.println("=== All Functions (" + fm.getFunctionCount() + ") ===");
+                  FunctionIterator fIter = fm.getFunctions(true);
+                  while (fIter.hasNext()) {
+                      Function fn = fIter.next();
+                      pw1.println(fn.getEntryPoint() + " | " + fn.getName() + " | size=" + fn.getBody().getNumAddresses());
                   }
-                }
+                  pw1.close();
+
+                  // 2. Key functions
+                  PrintWriter pw2 = new PrintWriter(new File(outDir + "/02_key_functions.txt"));
+                  pw2.println("=== Key Functions ===");
+                  String[] keywords = {"sign", "verify", "check", "hash", "package", "init", "jni",
+                      "cert", "valid", "metasec", "pitaya", "jwp", "wasm", "vm_", "_vm",
+                      "shark", "block", "risk", "security", "apk", "dex", "hook", "detect",
+                      "tamper", "integrity", "register", "native"};
+                  fIter = fm.getFunctions(true);
+                  while (fIter.hasNext()) {
+                      Function fn = fIter.next();
+                      String name = fn.getName().toLowerCase();
+                      for (String kw : keywords) {
+                          if (name.contains(kw)) {
+                              pw2.println(fn.getEntryPoint() + " | " + fn.getName() + " | size=" + fn.getBody().getNumAddresses());
+                              break;
+                          }
+                      }
+                  }
+                  pw2.close();
+
+                  // 3. JNI_OnLoad decompilation
+                  PrintWriter pw3 = new PrintWriter(new File(outDir + "/03_jni_onload.txt"));
+                  pw3.println("=== JNI_OnLoad Analysis ===");
+                  Function jniFunc = null;
+                  fIter = fm.getFunctions(true);
+                  while (fIter.hasNext()) {
+                      Function fn = fIter.next();
+                      if (fn.getName().equals("JNI_OnLoad")) {
+                          jniFunc = fn;
+                          break;
+                      }
+                  }
+                  if (jniFunc != null) {
+                      pw3.println("Found at: " + jniFunc.getEntryPoint() + " size=" + jniFunc.getBody().getNumAddresses());
+                      DecompInterface decompiler = new DecompInterface();
+                      decompiler.openProgram(currentProgram);
+                      DecompileResults results = decompiler.decompileFunction(jniFunc, 120, monitor);
+                      if (results != null && results.getDecompiledFunction() != null) {
+                          pw3.println(results.getDecompiledFunction().getC());
+                      } else {
+                          pw3.println("Decompilation failed, showing assembly:");
+                          InstructionIterator iIter = listing.getInstructions(jniFunc.getBody(), true);
+                          int count = 0;
+                          while (iIter.hasNext() && count < 300) {
+                              Instruction inst = iIter.next();
+                              pw3.println(inst.getAddress() + "  " + inst);
+                              count++;
+                          }
+                      }
+                      decompiler.dispose();
+                  } else {
+                      pw3.println("JNI_OnLoad NOT FOUND");
+                  }
+                  pw3.close();
+
+                  // 4. Top 50 largest functions
+                  PrintWriter pw4 = new PrintWriter(new File(outDir + "/04_large_functions.txt"));
+                  pw4.println("=== Top 50 Largest Functions ===");
+                  List<String[]> funcList = new ArrayList<>();
+                  fIter = fm.getFunctions(true);
+                  while (fIter.hasNext()) {
+                      Function fn = fIter.next();
+                      funcList.add(new String[]{fn.getEntryPoint().toString(), fn.getName(),
+                          String.valueOf(fn.getBody().getNumAddresses())});
+                  }
+                  funcList.sort((a, b) -> Long.compare(Long.parseLong(b[2]), Long.parseLong(a[2])));
+                  for (int i = 0; i < Math.min(50, funcList.size()); i++) {
+                      String[] f = funcList.get(i);
+                      pw4.println(f[0] + " | " + f[1] + " | size=" + f[2]);
+                  }
+                  pw4.close();
+
+                  // 5. String references for key terms
+                  PrintWriter pw5 = new PrintWriter(new File(outDir + "/05_string_xrefs.txt"));
+                  pw5.println("=== String Cross-References ===");
+                  DataIterator dIter = listing.getDefinedData(true);
+                  while (dIter.hasNext()) {
+                      Data data = dIter.next();
+                      Object val = data.getValue();
+                      if (val != null && val instanceof String) {
+                          String s = ((String)val).toLowerCase();
+                          if (s.contains("signature") || s.contains("packageinfo") ||
+                              s.contains("getpackage") || s.contains("/data/data") ||
+                              s.contains("base.apk") || s.contains("metasec") ||
+                              s.contains("pitaya") || s.contains("jwp_call") ||
+                              s.contains("should_have") || s.contains("package_version")) {
+                              pw5.println("\nString: \"" + val + "\" at " + data.getAddress());
+                              ReferenceIterator refs = data.getReferenceIteratorTo();
+                              while (refs.hasNext()) {
+                                  Reference ref = refs.next();
+                                  Function refFn = fm.getFunctionContaining(ref.getFromAddress());
+                                  String fnName = refFn != null ? refFn.getName() : "unknown";
+                                  pw5.println("  Referenced by: " + ref.getFromAddress() + " in " + fnName);
+                              }
+                          }
+                      }
+                  }
+                  pw5.close();
+
+                  println("Analysis complete!");
               }
-            }
           }
-          pw4.close()
+          JAVA_SCRIPT
 
-          // 5. Export large functions (likely main logic)
-          def pw5 = new PrintWriter(new File("/tmp/ghidra_proj/large_functions.txt"))
-          pw5.println("=== Top 50 Largest Functions ===")
-          def funcList = []
-          fm.getFunctions(true).each { fn ->
-            funcList.add([name: fn.getName(), addr: fn.getEntryPoint().toString(), size: fn.getBody().getNumAddresses()])
-          }
-          funcList.sort { -it.size }
-          funcList.take(50).each { f ->
-            pw5.println("${f.addr} | ${f.name} | size=${f.size}")
-          }
-          pw5.close()
-
-          println "Analysis complete. Files written to /tmp/ghidra_proj/"
-          GHIDRA_SCRIPT
+      - name: Run Ghidra analysis
+        run: |
+          SO="so_files/lib/arm64-v8a/libmetasec_ov.so"
+          ghidra/support/analyzeHeadless /tmp/ghidra_proj MetasecProject \
+            -import "$SO" \
+            -processor AARCH64:LE:64:v8A \
+            -scriptPath /tmp \
+            -postScript MetasecAnalysis.java
 
       - name: Collect results
+        if: always()
         run: |
-          cp /tmp/ghidra_proj/functions.txt logs/01_all_functions.txt 2>/dev/null || echo "NOT GENERATED" > logs/01_all_functions.txt
-          cp /tmp/ghidra_proj/key_functions.txt logs/02_key_functions.txt 2>/dev/null || echo "NOT GENERATED" > logs/02_key_functions.txt
-          cp /tmp/ghidra_proj/jni_onload.txt logs/03_jni_onload.txt 2>/dev/null || echo "NOT GENERATED" > logs/03_jni_onload.txt
-          cp /tmp/ghidra_proj/string_xrefs.txt logs/04_string_xrefs.txt 2>/dev/null || echo "NOT GENERATED" > logs/04_string_xrefs.txt
-          cp /tmp/ghidra_proj/large_functions.txt logs/05_large_functions.txt 2>/dev/null || echo "NOT GENERATED" > logs/05_large_functions.txt
+          for f in /tmp/ghidra_output/*.txt; do
+            if [ -f "$f" ]; then
+              cp "$f" logs/
+            fi
+          done
+          # Fallback if no output
+          if [ ! "$(ls -A logs/ 2>/dev/null)" ]; then
+            echo "No analysis output generated" > logs/00_status.txt
+          fi
           ls -la logs/
 
       - name: Upload
