@@ -1,0 +1,302 @@
+name: 【分析】v19e - 提取XOR密钥并解密所有字符串
+
+on:
+  workflow_dispatch:
+
+jobs:
+  decrypt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Ghidra and tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip python3
+          curl -fL --retry 3 -o ghidra.zip \
+            https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0.4_build/ghidra_12.0.4_PUBLIC_20260303.zip
+          unzip -q ghidra.zip
+          mv ghidra_* ghidra
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract SO
+        run: |
+          mkdir -p so_files logs
+          unzip -o official.apk "lib/arm64-v8a/libmetasec_ov.so" -d so_files/
+
+      - name: Create Ghidra key extraction script
+        run: |
+          mkdir -p /tmp/ghidra_proj /tmp/ghidra_output
+          cat > /tmp/ExtractKeys.java << 'JAVA_SCRIPT'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.mem.*;
+          import ghidra.program.model.address.*;
+          import java.io.*;
+
+          public class ExtractKeys extends GhidraScript {
+              private String hexDump(long offset, int length) throws Exception {
+                  Memory mem = currentProgram.getMemory();
+                  Address addr = currentProgram.getAddressFactory()
+                      .getDefaultAddressSpace().getAddress(offset);
+                  byte[] bytes = new byte[length];
+                  mem.getBytes(addr, bytes);
+                  StringBuilder sb = new StringBuilder();
+                  for (byte b : bytes) sb.append(String.format("%02x", b & 0xFF));
+                  return sb.toString();
+              }
+
+              @Override
+              public void run() throws Exception {
+                  PrintWriter pw = new PrintWriter(new File("/tmp/ghidra_output/keys_and_data.txt"));
+                  
+                  // XOR keys area (wide dump to catch all keys)
+                  pw.println("KEY_AREA_0028b200=" + hexDump(0x0028b200L, 128));
+                  pw.println("KEY_C_0028b258=" + hexDump(0x0028b258L, 8));
+                  pw.println("KEY_D_0028b250=" + hexDump(0x0028b250L, 8));
+                  pw.println("KEY_D_SIMD_0028b220=" + hexDump(0x0028b220L, 16));
+                  
+                  // All encrypted data from FUN_001c568c (signature verification)
+                  pw.println("SIG_class_A_B=" + hexDump(0x0027be3eL, 24));
+                  pw.println("SIG_method_E=" + hexDump(0x0027be2cL, 18));
+                  pw.println("SIG_msig_D=" + hexDump(0x0027bdbdL, 22));
+                  pw.println("SIG_class_B_A=" + hexDump(0x0027bde4L, 34));
+                  pw.println("SIG_method2_E=" + hexDump(0x0027bdd3L, 17));
+                  pw.println("SIG_msig2_D=" + hexDump(0x0027bda2L, 22));
+                  pw.println("SIG_static_B=" + hexDump(0x0027bda2L, 27));
+                  pw.println("SIG_arg_A=" + hexDump(0x0027bd8fL, 19));
+                  pw.println("SIG_field_D=" + hexDump(0x0027bf08L, 39));
+                  
+                  // Encrypted data from FUN_001c00f0 (main dispatcher)
+                  pw.println("MAIN_arg1_C=" + hexDump(0x0027b5c2L, 21));
+                  pw.println("MAIN_arg2_B=" + hexDump(0x0027b59bL, 39));
+                  pw.println("MAIN_arg3_A=" + hexDump(0x0027b58aL, 17));
+                  pw.println("MAIN_arg4_E=" + hexDump(0x0027b987L, 19));
+                  pw.println("MAIN_arg5_D=" + hexDump(0x0027b572L, 24));
+                  
+                  // Check list items from 001c00f0
+                  pw.println("CHK_class1_A=" + hexDump(0x0027b346L, 35));
+                  pw.println("CHK_class2_A=" + hexDump(0x0027b32eL, 24));
+                  pw.println("CHK_method1_B=" + hexDump(0x0027b390L, 17));
+                  
+                  // Additional encrypted strings referenced in 001c00f0
+                  // These are class names used in the check chain
+                  pw.println("CHK_D1=" + hexDump(0x0027b3e4L, 33));
+                  pw.println("CHK_D2=" + hexDump(0x0027b413L, 17));
+                  pw.println("CHK_D3=" + hexDump(0x0027b449L, 26));
+                  pw.println("CHK_D4=" + hexDump(0x0027b46dL, 48));
+                  pw.println("CHK_D5=" + hexDump(0x0027b49dL, 96));
+                  
+                  // More strings from 001c568c context
+                  pw.println("SIG_ctx1=" + hexDump(0x0027be06L, 18));
+                  pw.println("SIG_ctx2=" + hexDump(0x0027be16L, 10));
+                  pw.println("SIG_ctx3=" + hexDump(0x0027be24L, 8));
+                  
+                  // Error message strings (these might reveal class/method names in error text)
+                  pw.println("ERR1_A=" + hexDump(0x0027be56L, 30));
+                  pw.println("ERR2_C=" + hexDump(0x0027be74L, 40));
+                  pw.println("ERR3_B=" + hexDump(0x0027be9cL, 29));
+                  pw.println("ERR4_B=" + hexDump(0x0027beb9L, 38));
+                  pw.println("ERR5_E=" + hexDump(0x0027bedfL, 41));
+                  pw.println("ERR6_D=" + hexDump(0x0027bf08L, 39));
+                  
+                  // Wide dump of the main encrypted data region
+                  pw.println("REGION_27b300=" + hexDump(0x0027b300L, 256));
+                  pw.println("REGION_27b500=" + hexDump(0x0027b500L, 256));
+                  pw.println("REGION_27b900=" + hexDump(0x0027b900L, 256));
+                  pw.println("REGION_27bd00=" + hexDump(0x0027bd00L, 256));
+                  pw.println("REGION_27be00=" + hexDump(0x0027be00L, 256));
+                  
+                  pw.flush();
+                  pw.close();
+                  println("Key extraction complete!");
+              }
+          }
+          JAVA_SCRIPT
+
+      - name: Run Ghidra extraction
+        run: |
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          export PATH=$JAVA_HOME/bin:$PATH
+          
+          ghidra/support/analyzeHeadless /tmp/ghidra_proj MetasecProject \
+            -import so_files/lib/arm64-v8a/libmetasec_ov.so \
+            -processor AARCH64:LE:64:v8A \
+            -scriptPath /tmp \
+            -postScript ExtractKeys.java \
+            2>&1 | tail -5
+
+      - name: Decrypt all strings
+        run: |
+          python3 << 'PYEOF'
+          import sys
+
+          # Read extracted data
+          data = {}
+          with open("/tmp/ghidra_output/keys_and_data.txt") as f:
+              for line in f:
+                  line = line.strip()
+                  if "=" in line:
+                      k, v = line.split("=", 1)
+                      data[k] = bytes.fromhex(v)
+
+          print("=" * 80)
+          print("XOR KEYS EXTRACTED")
+          print("=" * 80)
+
+          key_c = data.get("KEY_C_0028b258", b"")
+          key_d = data.get("KEY_D_0028b250", b"")
+          key_d_simd = data.get("KEY_D_SIMD_0028b220", b"")
+          key_area = data.get("KEY_AREA_0028b200", b"")
+
+          print(f"Key C (0x28b258): {key_c.hex()}")
+          print(f"Key D (0x28b250): {key_d.hex()}")
+          print(f"Key D SIMD (0x28b220): {key_d_simd.hex()}")
+          print(f"Key Area (0x28b200, 128 bytes): {key_area.hex()}")
+          print()
+
+          def xor_decrypt(encrypted, key):
+              """XOR decrypt with cycling key"""
+              result = bytearray(len(encrypted))
+              for i in range(len(encrypted)):
+                  result[i] = encrypted[i] ^ key[i % len(key)]
+              return bytes(result)
+
+          def try_decrypt(name, encrypted, key, key_name):
+              """Try to decrypt and show result"""
+              decrypted = xor_decrypt(encrypted, key)
+              try:
+                  text = decrypted.decode('utf-8', errors='replace')
+                  printable = all(32 <= b < 127 or b == 0 for b in decrypted)
+              except:
+                  text = decrypted.hex()
+                  printable = False
+              status = "✓" if printable else "?"
+              print(f"  {status} {name} [{key_name}]: {text}")
+              print(f"    hex: {decrypted.hex()}")
+              return decrypted, printable
+
+          # All potential 8-byte keys from the key area
+          potential_keys = {}
+          for offset in range(0, len(key_area) - 7, 8):
+              key = key_area[offset:offset+8]
+              addr = 0x0028b200 + offset
+              potential_keys[f"0x{addr:08x}"] = key
+
+          print("=" * 80)
+          print("DECRYPT WITH KNOWN KEYS (C and D)")
+          print("=" * 80)
+
+          # Decrypt C targets
+          print("\n--- Decrypt C (key at 0x28b258) ---")
+          for name in sorted(data.keys()):
+              if name.endswith("_C"):
+                  try_decrypt(name, data[name], key_c, "key_C")
+
+          # Decrypt D targets  
+          print("\n--- Decrypt D (key at 0x28b250) ---")
+          for name in sorted(data.keys()):
+              if name.endswith("_D"):
+                  try_decrypt(name, data[name], key_d, "key_D")
+
+          print("\n" + "=" * 80)
+          print("BRUTE-FORCE ALL KEYS ON ALL ENCRYPTED DATA")
+          print("=" * 80)
+
+          # Try every 8-byte key on every piece of encrypted data
+          all_encrypted = {k: v for k, v in data.items() 
+                         if k.startswith(("SIG_", "MAIN_", "CHK_", "ERR_"))}
+
+          best_results = {}
+          for enc_name, enc_data in sorted(all_encrypted.items()):
+              print(f"\n--- {enc_name} ({len(enc_data)} bytes) ---")
+              found_readable = False
+              for key_addr, key_bytes in potential_keys.items():
+                  decrypted = xor_decrypt(enc_data, key_bytes)
+                  # Check if result looks like a Java class/method name
+                  try:
+                      text = decrypted.decode('ascii')
+                      if all(c.isalnum() or c in '/.;()[]$_<>ZBCSIJFDLV' for c in text if c != '\0'):
+                          if any(c.isalpha() for c in text):
+                              print(f"  ✓ Key {key_addr}: {text}")
+                              best_results[enc_name] = (key_addr, text)
+                              found_readable = True
+                  except:
+                      pass
+              
+              if not found_readable:
+                  # Show all attempts with key_c and key_d
+                  dec_c = xor_decrypt(enc_data, key_c)
+                  dec_d = xor_decrypt(enc_data, key_d)
+                  print(f"  key_C: {dec_c.hex()} | {dec_c.decode('utf-8', errors='replace')}")
+                  print(f"  key_D: {dec_d.hex()} | {dec_d.decode('utf-8', errors='replace')}")
+
+          print("\n" + "=" * 80)
+          print("DECRYPT WIDE REGIONS (searching for Java class patterns)")
+          print("=" * 80)
+
+          for region_name in sorted(data.keys()):
+              if not region_name.startswith("REGION_"):
+                  continue
+              region = data[region_name]
+              for key_addr, key_bytes in potential_keys.items():
+                  decrypted = xor_decrypt(region, key_bytes)
+                  # Search for Java-like patterns
+                  text = decrypted.decode('ascii', errors='replace')
+                  # Look for strings like "android/", "java/", "com/", "Landroid", etc.
+                  for pattern in ['android/', 'java/', 'com/', 'Landroid', 'Ljava', 
+                                  'PackageManager', 'PackageInfo', 'getPackage', 'Signature',
+                                  'signatures', 'getSign', 'Context', 'Application',
+                                  'contentprovider', 'content/pm']:
+                      idx = text.lower().find(pattern.lower())
+                      if idx >= 0:
+                          # Extract surrounding readable text
+                          start = max(0, idx - 10)
+                          end = min(len(text), idx + 60)
+                          snippet = text[start:end]
+                          clean = ''.join(c if (32 <= ord(c) < 127) else '.' for c in snippet)
+                          print(f"  MATCH in {region_name} with {key_addr}: ...{clean}...")
+
+          print("\n" + "=" * 80)
+          print("SUMMARY OF DECRYPTED STRINGS")
+          print("=" * 80)
+          for name, (key, text) in sorted(best_results.items()):
+              print(f"  {name}: {text}")
+
+          # Save all results
+          with open("/tmp/ghidra_output/decrypted_results.txt", "w") as f:
+              f.write("=== DECRYPTED STRINGS ===\n\n")
+              for name, (key, text) in sorted(best_results.items()):
+                  f.write(f"{name} [key={key}]: {text}\n")
+              f.write("\n=== RAW DATA ===\n\n")
+              for k, v in sorted(data.items()):
+                  f.write(f"{k}={v.hex()}\n")
+
+          PYEOF
+
+      - name: Collect results
+        if: always()
+        run: |
+          cp /tmp/ghidra_output/*.txt logs/ 2>/dev/null || true
+          ls -la logs/
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v19e-decrypted-strings
+          path: logs/
+          retention-days: 7
