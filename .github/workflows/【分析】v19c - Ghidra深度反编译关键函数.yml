@@ -1,0 +1,187 @@
+name: 【分析】v19c - Ghidra深度反编译关键函数
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Ghidra
+        run: |
+          curl -fL --retry 3 -o ghidra.zip \
+            https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.1_build/ghidra_11.3.1_PUBLIC_20250219.zip
+          unzip -q ghidra.zip
+          mv ghidra_* ghidra
+
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq unzip
+
+      - name: Download Official APK
+        run: |
+          gh release download official --pattern "*.apk" --dir .
+          mv *.apk official.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract SO
+        run: |
+          mkdir -p so_files
+          unzip -o official.apk "lib/arm64-v8a/libmetasec_ov.so" -d so_files/
+          ls -la so_files/lib/arm64-v8a/
+
+      - name: Create analysis script and directories
+        run: |
+          mkdir -p logs
+          mkdir -p /tmp/ghidra_proj
+          mkdir -p /tmp/ghidra_output
+          cat > /tmp/DeepDecompile.java << 'JAVA_SCRIPT'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.symbol.*;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.address.*;
+          import ghidra.app.decompiler.*;
+          import java.io.*;
+
+          public class DeepDecompile extends GhidraScript {
+              
+              private String decompileAt(long offset, String label, DecompInterface decomp) {
+                  Address addr = currentProgram.getAddressFactory()
+                      .getDefaultAddressSpace().getAddress(offset);
+                  Function fn = currentProgram.getFunctionManager().getFunctionAt(addr);
+                  if (fn == null) {
+                      fn = currentProgram.getFunctionManager().getFunctionContaining(addr);
+                  }
+                  if (fn == null) return "FUNCTION NOT FOUND at 0x" + Long.toHexString(offset);
+                  
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("=== " + label + " ===\n");
+                  sb.append("Address: " + fn.getEntryPoint() + "\n");
+                  sb.append("Name: " + fn.getName() + "\n");
+                  sb.append("Size: " + fn.getBody().getNumAddresses() + " bytes\n\n");
+                  
+                  DecompileResults results = decomp.decompileFunction(fn, 180, monitor);
+                  if (results != null && results.getDecompiledFunction() != null) {
+                      sb.append(results.getDecompiledFunction().getC());
+                  } else {
+                      sb.append("DECOMPILATION FAILED - showing first 200 instructions:\n");
+                      Listing listing = currentProgram.getListing();
+                      InstructionIterator iIter = listing.getInstructions(fn.getBody(), true);
+                      int count = 0;
+                      while (iIter.hasNext() && count < 200) {
+                          Instruction inst = iIter.next();
+                          sb.append(inst.getAddress() + "  " + inst + "\n");
+                          count++;
+                      }
+                  }
+                  return sb.toString();
+              }
+
+              @Override
+              public void run() throws Exception {
+                  String outDir = "/tmp/ghidra_output";
+                  
+                  DecompInterface decomp = new DecompInterface();
+                  decomp.openProgram(currentProgram);
+
+                  // File 1: JWP bridge functions (how metasec calls Java)
+                  PrintWriter pw1 = new PrintWriter(new File(outDir + "/01_jwp_bridges.txt"));
+                  pw1.println(decompileAt(0x0022b924L, "JWP_CallStaticMethodByNameV", decomp));
+                  pw1.println("\n" + "=".repeat(80) + "\n");
+                  pw1.println(decompileAt(0x0022bd14L, "JWP_CallMethodByNameV", decomp));
+                  pw1.println("\n" + "=".repeat(80) + "\n");
+                  pw1.println(decompileAt(0x0022c078L, "FUN after JWP_CallMethod (possible JWP helper)", decomp));
+                  pw1.close();
+
+                  // File 2: METASEC core functions
+                  PrintWriter pw2 = new PrintWriter(new File(outDir + "/02_metasec_core.txt"));
+                  pw2.println(decompileAt(0x001c568cL, "METASEC referenced 6x - core logic", decomp));
+                  pw2.println("\n" + "=".repeat(80) + "\n");
+                  pw2.println(decompileAt(0x001c00f0L, "METASEC large function (8680 bytes)", decomp));
+                  pw2.close();
+
+                  // File 3: Largest function (possible WASM VM interpreter)
+                  PrintWriter pw3 = new PrintWriter(new File(outDir + "/03_largest_function.txt"));
+                  pw3.println(decompileAt(0x0016a120L, "LARGEST function (15928 bytes) - possible VM interpreter", decomp));
+                  pw3.close();
+
+                  // File 4: VM dispatch / thunk targets
+                  PrintWriter pw4 = new PrintWriter(new File(outDir + "/04_vm_dispatch.txt"));
+                  pw4.println(decompileAt(0x002427a4L, "Thunk target #1 (4300 bytes) - main dispatcher", decomp));
+                  pw4.println("\n" + "=".repeat(80) + "\n");
+                  pw4.println(decompileAt(0x002449e8L, "Thunk target #2 (500 bytes)", decomp));
+                  pw4.println("\n" + "=".repeat(80) + "\n");
+                  pw4.println(decompileAt(0x00244bdcL, "Thunk target #3 (4560 bytes)", decomp));
+                  pw4.close();
+
+                  // File 5: INIT_99 (12624 bytes - abnormally large init)
+                  PrintWriter pw5 = new PrintWriter(new File(outDir + "/05_init99_and_jni.txt"));
+                  pw5.println(decompileAt(0x001428e4L, "INIT_99 (12624 bytes) - massive initializer", decomp));
+                  pw5.println("\n" + "=".repeat(80) + "\n");
+                  pw5.println(decompileAt(0x0014aae0L, "JNI_OnLoad (76 bytes)", decomp));
+                  pw5.println("\n" + "=".repeat(80) + "\n");
+                  // Sample one typical INIT pattern to confirm JNI registration
+                  pw5.println(decompileAt(0x0012ebf4L, "INIT_2 (316 bytes) - sample normal INIT", decomp));
+                  pw5.println("\n" + "=".repeat(80) + "\n");
+                  pw5.println(decompileAt(0x0012ed78L, "FUN after INIT_3 (500 bytes) - sample JNI wrapper", decomp));
+                  pw5.close();
+
+                  // File 6: Other METASEC-referencing functions + signature-related
+                  PrintWriter pw6 = new PrintWriter(new File(outDir + "/06_other_metasec.txt"));
+                  pw6.println(decompileAt(0x0017574cL, "METASEC ref - large func (4824 bytes)", decomp));
+                  pw6.println("\n" + "=".repeat(80) + "\n");
+                  pw6.println(decompileAt(0x0017b618L, "METASEC ref 2x (420 bytes)", decomp));
+                  pw6.println("\n" + "=".repeat(80) + "\n");
+                  pw6.println(decompileAt(0x00220bbcL, "METASEC ref 5x (1476 bytes)", decomp));
+                  pw6.close();
+
+                  decomp.dispose();
+                  println("Deep decompilation complete! Files in " + outDir);
+              }
+          }
+          JAVA_SCRIPT
+
+      - name: Run Ghidra analysis
+        run: |
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          export PATH=$JAVA_HOME/bin:$PATH
+          java -version
+          
+          SO="so_files/lib/arm64-v8a/libmetasec_ov.so"
+          ghidra/support/analyzeHeadless /tmp/ghidra_proj MetasecProject \
+            -import "$SO" \
+            -processor AARCH64:LE:64:v8A \
+            -scriptPath /tmp \
+            -postScript DeepDecompile.java
+
+      - name: Collect results
+        if: always()
+        run: |
+          for f in /tmp/ghidra_output/*.txt; do
+            if [ -f "$f" ]; then
+              cp "$f" logs/
+            fi
+          done
+          if [ ! "$(ls -A logs/ 2>/dev/null)" ]; then
+            echo "No output generated" > logs/00_status.txt
+          fi
+          ls -la logs/
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v19c-deep-decompile
+          path: logs/
+          retention-days: 7
