@@ -40,7 +40,7 @@ jobs:
         run: |
           java -jar apktool.jar d -f -r official.apk -o smali_work > /dev/null 2>&1 || true
           echo "smali directories: $(ls -d smali_work/smali_classes* 2>/dev/null | wc -l)"
-          # 新增：单独反编译 Manifest 以便后续获取主 Application 类名
+          # 新增：单独反编译以读取 AndroidManifest.xml 获取 Application 类名
           java -jar apktool.jar d -f -s official.apk -o temp_decode > /dev/null 2>&1 || true
 
       - name: "Patch 1: vega CrackingInterceptor (skip-all + neutralize b, keep native)"
@@ -864,7 +864,8 @@ jobs:
 
       - name: "Patch 20: 狸猫换太子 (APK Path Spoofing for Metasec)"
         run: |
-          # 1. 编写 Java 代理类 (MetasecSpoofer)
+          set -e
+          echo "1. Writing MetasecSpoofer.java..."
           cat > MetasecSpoofer.java << 'JAVAEOF'
           package com.vega;
           import android.content.Context;
@@ -899,7 +900,7 @@ jobs:
 
               private static boolean isMetasecCaller() {
                   StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-                  if (stack.length <= 8) return true; // JNI 直接调用通常栈很浅
+                  if (stack.length <= 8) return true;
                   for (StackTraceElement elem : stack) {
                       String cls = elem.getClassName().toLowerCase();
                       if (cls.contains("metasec") || cls.contains("sec") || 
@@ -937,49 +938,81 @@ jobs:
           }
           JAVAEOF
 
-          # 2. 将 Java 编译为 DEX
-          javac -source 8 -target 8 -bootclasspath "$ANDROID_HOME/platforms/android-34/android.jar" MetasecSpoofer.java
+          echo "2. Compiling Java to DEX..."
+          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -1)
+          echo "Using Android JAR: $ANDROID_JAR"
+          javac -source 8 -target 8 -bootclasspath "$ANDROID_JAR" MetasecSpoofer.java
+          
           D8=$(find "$ANDROID_HOME/build-tools" -name d8 -type f | sort -V | tail -1)
+          echo "Using D8: $D8"
           "$D8" --release --output . MetasecSpoofer.class
+          
+          if [ ! -f classes.dex ]; then
+              echo "FAIL: classes.dex was not created by d8."
+              exit 1
+          fi
 
-          # 3. 将 DEX 转为 Smali 并移入项目
-          java -jar apktool.jar d -f classes.dex -o spoofer_smali > /dev/null 2>&1
+          echo "3. Converting DEX to Smali..."
+          java -jar apktool.jar d -f classes.dex -o spoofer_smali > /dev/null 2>&1 || true
+          SPOOFER_SMALI=$(find spoofer_smali -name "MetasecSpoofer.smali")
+          if [ -z "$SPOOFER_SMALI" ]; then
+              echo "FAIL: MetasecSpoofer.smali not found after decompilation!"
+              exit 1
+          fi
+          
+          echo "Copying $SPOOFER_SMALI to smali_work"
           mkdir -p smali_work/smali_classes15/com/vega/
-          cp -r spoofer_smali/smali/com/vega/MetasecSpoofer.smali smali_work/smali_classes15/com/vega/
+          cp "$SPOOFER_SMALI" smali_work/smali_classes15/com/vega/
 
-          # 4. 动态寻找主 Application 类并注入劫持代码
+          echo "4. Patching Main Application Class..."
           python3 << 'PYEOF'
-          import os, re
+          import os, re, sys, glob, traceback
           import xml.etree.ElementTree as ET
 
-          tree = ET.parse('temp_decode/AndroidManifest.xml')
-          root = tree.getroot()
-          app_node = root.find('application')
-          app_class = app_node.get('{http://schemas.android.com/apk/res/android}name')
-          print(f"App class from manifest: {app_class}")
+          try:
+              print("Parsing AndroidManifest.xml...")
+              tree = ET.parse('temp_decode/AndroidManifest.xml')
+              root = tree.getroot()
+              package_name = root.get('package')
+              
+              app_node = root.find('application')
+              app_class = None
+              for k, v in app_node.attrib.items():
+                  if k.endswith('name'):
+                      app_class = v
+                      break
+                      
+              if not app_class:
+                  print("FAIL: No application class found in manifest!")
+                  sys.exit(1)
+                  
+              print(f"Original App class: {app_class}")
+              
+              if app_class.startswith('.'):
+                  app_class = package_name + app_class
+              elif '.' not in app_class:
+                  app_class = package_name + '.' + app_class
+                  
+              print(f"Resolved App class: {app_class}")
+              
+              class_path = "smali_work/smali*/" + app_class.replace('.', '/') + ".smali"
+              files = glob.glob(class_path)
+              if not files:
+                  print(f"FAIL: Smali file for {app_class} not found!")
+                  sys.exit(1)
+                  
+              filepath = files[0]
+              print(f"Target smali file: {filepath}")
+              
+              with open(filepath, 'r') as f: 
+                  content = f.read()
 
-          import glob
-          class_path = "smali_work/smali*/" + app_class.replace('.', '/') + ".smali"
-          files = glob.glob(class_path)
-          if not files:
-              print(f"FAIL: App class {app_class} not found!")
-              sys.exit(1)
-          filepath = files[0]
+              pat_super = re.search(r'\.super\s+(L[^;]+;)', content)
+              super_cls = pat_super.group(1) if pat_super else "Landroid/app/Application;"
 
-          with open(filepath, 'r') as f: content = f.read()
-
-          pat_super = re.search(r'\.super\s+(L[^;]+;)', content)
-          super_cls = pat_super.group(1) if pat_super else "Landroid/app/Application;"
-
-          # 注入 init (释放官方 APK)
-          content = re.sub(
-              r'(\.method public onCreate\(\)V.*?\.locals \d+)',
-              r'\1\n    # PATCHED: Spoof Init\n    invoke-static {p0}, Lcom/vega/MetasecSpoofer;->init(Landroid/content/Context;)V\n',
-              content, flags=re.DOTALL
-          )
-
-          # 注入重写方法 (拦截路径获取)
-          new_methods = f"""
+              pat_oncreate = re.search(r'(\.method (?:public |protected |private )?onCreate\(\)V.*?\.locals \d+)', content, re.DOTALL)
+              
+              new_methods = f"""
           .method public getApplicationInfo()Landroid/content/pm/ApplicationInfo;
               .locals 2
               invoke-super {{p0}}, {super_cls}->getApplicationInfo()Landroid/content/pm/ApplicationInfo;
@@ -1007,12 +1040,33 @@ jobs:
               return-object v0
           .end method
           """
-          
-          if "getApplicationInfo" not in content:
-              content += "\n" + new_methods.strip() + "\n"
+              
+              if pat_oncreate:
+                  content = content[:pat_oncreate.end()] + "\n    # PATCHED: Spoof Init\n    invoke-static {p0}, Lcom/vega/MetasecSpoofer;->init(Landroid/content/Context;)V\n" + content[pat_oncreate.end():]
+              else:
+                  print("onCreate not found, injecting a new one")
+                  new_oncreate = f"""
+          .method public onCreate()V
+              .locals 1
+              invoke-super {{p0}}, {super_cls}->onCreate()V
+              invoke-static {{p0}}, Lcom/vega/MetasecSpoofer;->init(Landroid/content/Context;)V
+              return-void
+          .end method
+          """
+                  content += "\n" + new_oncreate
 
-          with open(filepath, 'w') as f: f.write(content)
-          print("OK: Application class patched successfully.")
+              if "getApplicationInfo" not in content:
+                  content += "\n" + new_methods.strip() + "\n"
+
+              with open(filepath, 'w') as f: 
+                  f.write(content)
+                  
+              print("OK: Application class patched successfully.")
+
+          except Exception as e:
+              print("PYTHON SCRIPT CRASHED:")
+              traceback.print_exc()
+              sys.exit(1)
           PYEOF
 
       - name: Recompile patched DEX files
@@ -1025,13 +1079,12 @@ jobs:
           fi
 
           mkdir -p patched_dex
-          # 新增了 classes.dex
+          # 此处添加了 classes.dex 的解压
           unzip -o temp_dex.apk classes.dex classes3.dex classes7.dex classes8.dex classes9.dex classes10.dex classes15.dex -d patched_dex/ 2>/dev/null
 
           echo "=== Patched DEX files ==="
           ls -la patched_dex/
 
-          # 校验新增了 classes.dex
           for f in classes.dex classes3.dex classes7.dex classes8.dex classes9.dex classes10.dex classes15.dex; do
             if [ ! -f "patched_dex/$f" ]; then
               echo "FAIL $f missing!"
@@ -1182,7 +1235,6 @@ jobs:
           cd ..
 
           cd patched_dex
-          # 新增打包 classes.dex
           zip -0 ../capcut_v20a.apk classes.dex
           zip -0 ../capcut_v20a.apk classes3.dex
           zip -0 ../capcut_v20a.apk classes7.dex
