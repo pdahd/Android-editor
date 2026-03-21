@@ -900,7 +900,7 @@ jobs:
 
               private static boolean isMetasecCaller() {
                   StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-                  if (stack.length <= 8) return true;
+                  if (stack.length <= 8) return true; // JNI 直接调用通常栈很浅
                   for (StackTraceElement elem : stack) {
                       String cls = elem.getClassName().toLowerCase();
                       if (cls.contains("metasec") || cls.contains("sec") || 
@@ -952,11 +952,16 @@ jobs:
               exit 1
           fi
 
-          echo "3. Converting DEX to Smali..."
-          java -jar apktool.jar d -f classes.dex -o spoofer_smali > /dev/null 2>&1 || true
+          echo "3. Converting DEX to Smali (using dummy APK trick)..."
+          # 欺骗 Apktool：把 dex 打包成临时的 apk 再反编译
+          zip -0 dummy.apk classes.dex
+          java -jar apktool.jar d -f dummy.apk -o spoofer_smali > /dev/null 2>&1 || true
+          
           SPOOFER_SMALI=$(find spoofer_smali -name "MetasecSpoofer.smali")
           if [ -z "$SPOOFER_SMALI" ]; then
               echo "FAIL: MetasecSpoofer.smali not found after decompilation!"
+              echo "=== Directory contents ==="
+              find spoofer_smali || true
               exit 1
           fi
           
@@ -1010,7 +1015,8 @@ jobs:
               pat_super = re.search(r'\.super\s+(L[^;]+;)', content)
               super_cls = pat_super.group(1) if pat_super else "Landroid/app/Application;"
 
-              pat_oncreate = re.search(r'(\.method (?:public |protected |private )?onCreate\(\)V.*?\.locals \d+)', content, re.DOTALL)
+              # 注入 init (释放官方 APK)
+              pat_oncreate = re.search(r'(\.method (?:public |protected |private )?onCreate\(\)V.*?\.locals \d+\s*)', content, re.DOTALL)
               
               new_methods = f"""
           .method public getApplicationInfo()Landroid/content/pm/ApplicationInfo;
