@@ -1,0 +1,403 @@
+name: "🗑️ 万能批量删除工具 v2.2.0（15框鲁棒增强版）"
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_box_1:
+        description: "【根目录单个文件】示例：README.md"
+        required: false
+
+      file_box_2:
+        description: "【根目录多个文件】空格分隔。示例：README.md LICENSE .gitignore"
+        required: false
+
+      file_box_3:
+        description: "【根目录单个文件夹】示例：temp_data/ 或 dist/"
+        required: false
+
+      file_box_4:
+        description: "【根目录多个文件夹】空格分隔。示例：eee/ 444/ cache/"
+        required: false
+
+      file_box_5:
+        description: "【深层单个文件】示例：docs/2024/final_report.pdf"
+        required: false
+
+      file_box_6:
+        description: "【深层单个文件夹】示例：eee/444/ 或 docs/old_versions/"
+        required: false
+
+      file_box_7:
+        description: "【深层多个路径】可混合文件/文件夹。示例：docs/old.pdf eee/444/ assets/demo/"
+        required: false
+
+      file_box_8:
+        description: "【当前目录通配删除】示例：*.log *.tmp *.bak"
+        required: false
+
+      file_box_9:
+        description: "【全仓库递归通配删除】示例：**/*.tmp **/*.cache **/*.bak"
+        required: false
+
+      file_box_10:
+        description: "【清空目录内容但保留目录】示例：cache/* build/* uploads/*"
+        required: false
+
+      file_box_11:
+        description: "【按目录名递归删目录】示例：**/__pycache__/ **/.ipynb_checkpoints/ **/node_modules/"
+        required: false
+
+      file_box_12:
+        description: "【按文件类型/模式删除】示例：images/*.png logs/**/*.log reports/**/*.csv"
+        required: false
+
+      file_box_13:
+        description: "【带空格的单个路径】必须加双引号。示例：\"My Photos/\" 或 \"docs/final report.pdf\""
+        required: false
+
+      file_box_14:
+        description: "【带空格的多个路径】每个目标都要加双引号。示例：\"My Photos/\" \"old docs/report 1.pdf\""
+        required: false
+
+      file_box_15:
+        description: "【终极混合框】任意文件/文件夹/通配符混合，带空格路径必须加双引号。示例：eee/ 444/ \"My Photos/\" cache/* **/*.bak docs/old/ dist/*.map"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: universal-delete-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  delete-process:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: 解析删除规则并直接执行删除
+        shell: bash
+        env:
+          BOX1: ${{ inputs.file_box_1 }}
+          BOX2: ${{ inputs.file_box_2 }}
+          BOX3: ${{ inputs.file_box_3 }}
+          BOX4: ${{ inputs.file_box_4 }}
+          BOX5: ${{ inputs.file_box_5 }}
+          BOX6: ${{ inputs.file_box_6 }}
+          BOX7: ${{ inputs.file_box_7 }}
+          BOX8: ${{ inputs.file_box_8 }}
+          BOX9: ${{ inputs.file_box_9 }}
+          BOX10: ${{ inputs.file_box_10 }}
+          BOX11: ${{ inputs.file_box_11 }}
+          BOX12: ${{ inputs.file_box_12 }}
+          BOX13: ${{ inputs.file_box_13 }}
+          BOX14: ${{ inputs.file_box_14 }}
+          BOX15: ${{ inputs.file_box_15 }}
+        run: |
+          set -Eeuo pipefail
+
+          python3 - <<'PY'
+          import os
+          import shlex
+          import glob
+          import shutil
+          import sys
+
+          root_abs = os.path.abspath(".")
+          root_real = os.path.realpath(root_abs)
+
+          raw_boxes = {i: os.environ.get(f"BOX{i}", "") for i in range(1, 16)}
+
+          SINGLE_LITERAL = {1, 3, 5, 6, 13}
+          MULTI_LITERAL = {2, 4, 7, 14}
+          GLOB_ONLY = {8, 9, 11, 12}
+          CLEAR_DIR = {10}
+          MIXED = {15}
+
+          def parse_tokens(idx, raw):
+              raw = (raw or "").strip()
+              if not raw:
+                  return []
+
+              try:
+                  tokens = [t.strip() for t in shlex.split(raw) if t.strip()]
+              except ValueError as e:
+                  print(f"❌ 输入框 {idx} 解析失败：{e}", file=sys.stderr)
+                  sys.exit(1)
+
+              if idx in SINGLE_LITERAL and len(tokens) != 1:
+                  print(
+                      f"❌ 输入框 {idx} 仅允许 1 个目标；如果路径包含空格，请使用双引号。",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              return tokens
+
+          def to_abs_lexical(path_text):
+              return os.path.abspath(os.path.join(root_abs, path_text))
+
+          def is_within_root_lexical(abs_path):
+              try:
+                  return os.path.commonpath([root_abs, abs_path]) == root_abs
+              except ValueError:
+                  return False
+
+          def is_within_root_real(real_path):
+              try:
+                  return os.path.commonpath([root_real, real_path]) == root_real
+              except ValueError:
+                  return False
+
+          def normalize_rel(abs_path):
+              rel = os.path.relpath(abs_path, root_abs).replace(os.sep, "/")
+              return "" if rel == "." else rel
+
+          def is_git_metadata(rel):
+              parts = [p for p in rel.split("/") if p]
+              return any(p == ".git" for p in parts)
+
+          def has_symlink_ancestor(abs_path):
+              rel = os.path.relpath(abs_path, root_abs)
+              if rel == ".":
+                  return False
+
+              parts = [p for p in rel.split(os.sep) if p]
+              current = root_abs
+
+              for part in parts[:-1]:
+                  current = os.path.join(current, part)
+                  if os.path.islink(current):
+                      return True
+
+              return False
+
+          def validate_candidate(abs_path, source_label):
+              if not is_within_root_lexical(abs_path):
+                  print(f"⛔ {source_label} 跳过仓库外路径：{abs_path}")
+                  return None
+
+              rel = normalize_rel(abs_path)
+
+              if not rel:
+                  print(f"⛔ {source_label} 跳过仓库根目录：{abs_path}")
+                  return None
+
+              if is_git_metadata(rel):
+                  print(f"⛔ {source_label} 跳过 Git 元数据路径：{rel}")
+                  return None
+
+              if has_symlink_ancestor(abs_path):
+                  print(f"⛔ {source_label} 跳过位于符号链接目录内部的路径：{rel}")
+                  return None
+
+              # 叶子节点是符号链接时，允许删除“链接本身”，不跟随到目标
+              if os.path.islink(abs_path):
+                  return rel
+
+              if not os.path.exists(abs_path):
+                  print(f"⚠️ {source_label} 目标不存在：{rel}")
+                  return None
+
+              real_path = os.path.realpath(abs_path)
+              if not is_within_root_real(real_path):
+                  print(f"⛔ {source_label} 跳过解析后位于仓库外的路径：{rel}")
+                  return None
+
+              return rel
+
+          matched = []
+          seen = set()
+
+          def add_rel(rel):
+              if rel and rel not in seen:
+                  seen.add(rel)
+                  matched.append(rel)
+
+          def expand_literal(idx, token):
+              abs_path = to_abs_lexical(token)
+              rel = validate_candidate(abs_path, f"[框{idx}]")
+              if rel:
+                  add_rel(rel)
+
+          def expand_glob(idx, pattern):
+              found_any = False
+              valid_any = False
+
+              for p in glob.iglob(pattern, recursive=True):
+                  found_any = True
+
+                  if p in ("", ".", "./", "..", "../", "/"):
+                      print(f"⛔ [框{idx}] 跳过危险路径：{p}")
+                      continue
+
+                  abs_path = to_abs_lexical(p)
+                  rel = validate_candidate(abs_path, f"[框{idx}]")
+                  if rel:
+                      add_rel(rel)
+                      valid_any = True
+
+              if not found_any:
+                  print(f"⚠️ [框{idx}] 未匹配到：{pattern}")
+              elif not valid_any:
+                  print(f"⚠️ [框{idx}] 匹配结果均无效：{pattern}")
+
+          def expand_clear_dir(idx, token):
+              original = token.strip()
+              dir_token = original
+
+              if dir_token.endswith("/*"):
+                  dir_token = dir_token[:-2]
+
+              dir_token = dir_token.rstrip("/")
+
+              if not dir_token:
+                  print(f"⛔ [框{idx}] 跳过危险目录：{original}")
+                  return
+
+              if glob.has_magic(dir_token):
+                  print(f"⚠️ [框{idx}] 该框仅支持明确目录路径或目录/*：{original}")
+                  return
+
+              abs_dir = to_abs_lexical(dir_token)
+
+              if not is_within_root_lexical(abs_dir):
+                  print(f"⛔ [框{idx}] 跳过仓库外路径：{original}")
+                  return
+
+              rel_dir = normalize_rel(abs_dir)
+
+              if not rel_dir:
+                  print(f"⛔ [框{idx}] 不允许清空仓库根目录内容：{original}")
+                  return
+
+              if is_git_metadata(rel_dir):
+                  print(f"⛔ [框{idx}] 跳过 Git 元数据路径：{rel_dir}")
+                  return
+
+              if has_symlink_ancestor(abs_dir):
+                  print(f"⛔ [框{idx}] 跳过位于符号链接目录内部的目录：{rel_dir}")
+                  return
+
+              if os.path.islink(abs_dir):
+                  print(f"⛔ [框{idx}] 清空目录框不处理符号链接目录：{rel_dir}")
+                  return
+
+              if not os.path.exists(abs_dir):
+                  print(f"⚠️ [框{idx}] 目录不存在：{rel_dir}")
+                  return
+
+              if not os.path.isdir(abs_dir):
+                  print(f"⚠️ [框{idx}] 目标不是目录，无法清空内容：{rel_dir}")
+                  return
+
+              real_dir = os.path.realpath(abs_dir)
+              if not is_within_root_real(real_dir):
+                  print(f"⛔ [框{idx}] 跳过解析后位于仓库外的目录：{rel_dir}")
+                  return
+
+              added = 0
+
+              try:
+                  with os.scandir(abs_dir) as it:
+                      for entry in it:
+                          child_abs = os.path.abspath(entry.path)
+                          child_rel = validate_candidate(child_abs, f"[框{idx}]")
+                          if child_rel and child_rel not in seen:
+                              add_rel(child_rel)
+                              added += 1
+              except Exception as e:
+                  print(f"❌ [框{idx}] 枚举目录失败：{rel_dir} -> {e}", file=sys.stderr)
+                  sys.exit(1)
+
+              if added == 0:
+                  print(f"ℹ️ [框{idx}] 目录已为空：{rel_dir}")
+
+          parsed_rules = []
+          for idx in range(1, 16):
+              tokens = parse_tokens(idx, raw_boxes[idx])
+              for token in tokens:
+                  parsed_rules.append((idx, token))
+
+          if not parsed_rules:
+              print("ℹ️ 没有提供任何删除规则，任务结束。")
+              sys.exit(0)
+
+          print("📦 已解析删除规则：")
+          for idx, token in parsed_rules:
+              print(f"  - [框{idx}] {token}")
+
+          for idx, token in parsed_rules:
+              if idx in SINGLE_LITERAL or idx in MULTI_LITERAL:
+                  expand_literal(idx, token)
+              elif idx in GLOB_ONLY:
+                  expand_glob(idx, token)
+              elif idx in CLEAR_DIR:
+                  expand_clear_dir(idx, token)
+              elif idx in MIXED:
+                  if glob.has_magic(token):
+                      expand_glob(idx, token)
+                  else:
+                      expand_literal(idx, token)
+
+          if not matched:
+              print("ℹ️ 没有任何有效匹配，任务结束。")
+              sys.exit(0)
+
+          matched.sort(key=lambda s: (s.count("/"), s), reverse=True)
+
+          print("")
+          print("🎯 有效匹配列表：")
+          for p in matched:
+              print(f"  - {p}")
+
+          print("")
+          print(f"🗑️ 开始执行删除，共 {len(matched)} 项。")
+
+          for rel in matched:
+              target_abs = to_abs_lexical(rel)
+
+              if not (os.path.exists(target_abs) or os.path.islink(target_abs)):
+                  print(f"⚠️ 目标已不存在，跳过：{rel}")
+                  continue
+
+              try:
+                  if os.path.islink(target_abs) or os.path.isfile(target_abs):
+                      os.remove(target_abs)
+                  elif os.path.isdir(target_abs):
+                      shutil.rmtree(target_abs)
+                  else:
+                      os.remove(target_abs)
+
+                  print(f"✅ 已删除：{rel}")
+              except Exception as e:
+                  print(f"❌ 删除失败：{rel} -> {e}", file=sys.stderr)
+                  sys.exit(1)
+          PY
+
+          git add -A
+          echo ""
+          echo "📌 已使用 git add -A 标记删除变更。"
+
+      - name: 提交并推送至仓库
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.quotepath false
+
+          if git diff --cached --quiet; then
+            echo "💡 没有任何变更，跳过提交。"
+            exit 0
+          fi
+
+          git commit -m "Actions: 自动批量清理指定文件/文件夹 [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
